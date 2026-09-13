@@ -1,6 +1,11 @@
 name = "stratoweave"
 fingerprint = 0x9ad673637ba15f05
 dependencies = {
+    "xcrypt": (
+        repo_url="https://github.com/stratoweave/actxcrypt",
+        url="https://github.com/stratoweave/actxcrypt/archive/ae02fb744f38827b4f7a3a929701ee1fb0b3fadd.zip",
+        hash="N-V-__8AAO6WAAA9e7Fini6yDgIZg07TdT2E3Dzu5qTQJw4_"
+    ),
     "actmf": (
         repo_url="https://github.com/stratoweave/actmf",
         url="https://github.com/stratoweave/actmf/archive/5438703680537525671e4d203af01bd7a3cb4f3e.zip",
@@ -32,4 +37,10 @@ dependencies = {
         hash="N-V-__8AALCPKAB1mL--ZBrVkl0r--9vyuQCZ25yjD-pBBDY"
     )
 }
-zig_dependencies = {}
+zig_dependencies = {
+    "oidc_crypto_headers": (
+        path="deps/oidc_crypto_headers",
+        options={"acton_sysdeps": "actonbase_dep.path(\"../deps\").getPath(b)"},
+        artifacts=["oidc_crypto_headers"]
+    )
+}

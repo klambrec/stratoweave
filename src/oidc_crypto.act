@@ -1,0 +1,77 @@
+"""Small cryptographic primitives for backend authentication.
+
+Randomness comes from the operating system. RSA/SHA-256 are implemented
+by the mbedTLS library already used by Acton's TLS runtime.
+"""
+import base64
+import xcrypt.lib as xcrypt
+
+def durable_runtime_enabled() -> bool:
+    """Whether this binary could persist actor state (including credentials)."""
+    NotImplemented
+
+
+def random_bytes() -> bytes:
+    """Return 32 cryptographically random bytes; fail if the OS RNG fails."""
+    NotImplemented
+
+
+def sha256(data: bytes) -> bytes:
+    NotImplemented
+
+
+def constant_time_equal(left: str, right: str) -> bool:
+    NotImplemented
+
+
+def verify_rs256(message: bytes, signature: bytes, modulus: bytes, exponent: bytes) -> bool:
+    """Verify PKCS#1 v1.5 SHA-256 with a 2048..8192-bit RSA public key."""
+    NotImplemented
+
+def json_document_valid(data: bytes) -> bool:
+    """Reject duplicate JSON members, embedded NULs and excessive nesting."""
+    NotImplemented
+
+def password_input_valid(password: str) -> bool:
+    NotImplemented
+
+
+def base64url(data: bytes) -> str:
+    return base64.encode(data).decode().replace("+", "-").replace("/", "_").rstrip("=")
+
+
+def decode_base64url(data: str) -> bytes:
+    if len(data) == 0 or len(data) % 4 == 1:
+        raise ValueError("Invalid base64url length")
+    for c in data:
+        if c not in "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_":
+            raise ValueError("Invalid base64url character")
+    decoded = base64.decode((data.replace("-", "+").replace("_", "/") + "=" * ((4 - len(data) % 4) % 4)).encode())
+    if base64url(decoded) != data:
+        raise ValueError("Noncanonical base64url value")
+    return decoded
+
+
+def random_token() -> str:
+    return base64url(random_bytes())
+
+
+def challenge(verifier: str) -> str:
+    return base64url(sha256(verifier.encode()))
+
+
+def verify_password(password: str, stored_hash: str) -> bool:
+    # bcrypt silently truncates at 72 bytes, and crypt uses C strings.
+    if not password_input_valid(password):
+        return False
+    if len(stored_hash) != 60 or not (stored_hash.startswith("$2a$") or stored_hash.startswith("$2b$") or stored_hash.startswith("$2y$")):
+        return False
+    try:
+        if stored_hash[4] not in "0123456789" or stored_hash[5] not in "0123456789":
+            return False
+        cost = "0123456789".find(stored_hash[4]) * 10 + "0123456789".find(stored_hash[5])
+        if cost < 4 or cost > 16 or stored_hash[6] != "$":
+            return False
+        return constant_time_equal(xcrypt.crypt(password, stored_hash), stored_hash)
+    except Exception:
+        return False

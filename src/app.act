@@ -1,4 +1,5 @@
 import argconf
+import auth as swauth
 import file
 import logging
 import ssh
@@ -150,6 +151,9 @@ class SystemSettings(value):
     startup_config_files: list[str]
     db_spec: ?str
     http_port: int
+    http_auth: swauth.Settings
+    http_tls_certificate_file: ?str
+    http_tls_private_key_file: ?str
     netconf_port: int
     netconf_host_key_path: ?str
     netconf_user: str
@@ -162,10 +166,15 @@ class SystemSettings(value):
                  netconf_host_key_path: ?str,
                  netconf_user: str, netconf_password: str,
                  netconf_ssh: SshTransportSettings,
-                 exit_on_done: bool):
+                 exit_on_done: bool, http_auth: ?swauth.Settings=None,
+                 http_tls_certificate_file: ?str=None,
+                 http_tls_private_key_file: ?str=None):
         self.startup_config_files = startup_config_files
         self.db_spec = db_spec
         self.http_port = http_port
+        self.http_auth = http_auth if http_auth is not None else swauth.Settings()
+        self.http_tls_certificate_file = http_tls_certificate_file
+        self.http_tls_private_key_file = http_tls_private_key_file
         self.netconf_port = netconf_port
         self.netconf_host_key_path = netconf_host_key_path
         self.netconf_user = netconf_user
@@ -183,6 +192,9 @@ class SystemSettings(value):
         )
         p.add_str("db", help="TTT database: an LMDB path or a database URL")
         p.add_int("http.port", default=80, help="HTTP listen port")
+        p.add_str("http.tls.certificate_file", help="PEM certificate file for native HTTPS")
+        p.add_str("http.tls.private_key_file", help="PEM private key file for native HTTPS")
+        swauth.Settings.declare(p)
         p.add_int("netconf.port", default=830, help="NETCONF SSH listen port")
         p.add_str(
             "netconf.user", default="admin",
@@ -206,6 +218,8 @@ class SystemSettings(value):
               environment: ?dict[str, str]=None) -> SystemSettings:
         """Resolve system settings without reading process state or files."""
         args = SystemSettings.parser().parse(argv, system_settings, environment)
+        if (args.get_opt_str("http.tls.certificate_file") is None) != (args.get_opt_str("http.tls.private_key_file") is None):
+            raise argconf.ConfigurationError("Native HTTPS requires both certificate_file and private_key_file")
         return SystemSettings(
             args.get_str_list("startup_config_files"),
             args.get_opt_str("db"),
@@ -215,7 +229,10 @@ class SystemSettings(value):
             args.get_str("netconf.user"),
             args.get_str("netconf.password"),
             SshTransportSettings.read(args, "netconf.ssh"),
-            args.get_bool("exit_on_done"))
+            args.get_bool("exit_on_done"),
+            swauth.Settings.read(args),
+            args.get_opt_str("http.tls.certificate_file"),
+            args.get_opt_str("http.tls.private_key_file"))
 
 
 NS_SW_RFS = "http://stratoweave.org/yang/stratoweave-rfs"

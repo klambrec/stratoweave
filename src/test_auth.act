@@ -1,0 +1,195 @@
+import auth
+import app
+import argconf
+import http
+import http_router
+import json
+import testing
+
+
+def _context(method: str, path: str, headers: dict[str, str]={}, body: bytes=b"") -> http_router.Context:
+    return http_router.Context(http.Request(method, path, b"1.1", headers, body), path, path, {})
+
+
+def _test_auth_settings_validation():
+    disabled = app.SystemSettings.parse(["app"])
+    testing.assertFalse(disabled.http_auth.enabled())
+    for args in [
+        ["app", "--http.auth.oidc.issuer=https://issuer.example"],
+        ["app", "--http.auth.local.username=admin"],
+        ["app", "--http.auth.local.password_hash_file=hash"],
+        ["app", "--http.auth.local.username=admin", "--http.auth.local.password_hash_file=hash"],
+        ["app", "--http.auth.public_origin=http://example.com", "--http.auth.allow_insecure_http", "--http.auth.local.username=admin", "--http.auth.local.password_hash_file=hash"],
+        ["app", "--http.tls.certificate_file=cert"]
+    ]:
+        rejected = False
+        try:
+            app.SystemSettings.parse(args)
+        except argconf.ConfigurationError:
+            rejected = True
+        testing.assertTrue(rejected, "Incomplete or insecure authentication settings must fail")
+    configured = app.SystemSettings.parse(["app"], environment={
+        "STRATOWEAVE_HTTP__AUTH__PUBLIC_ORIGIN": "http://localhost:3000",
+        "STRATOWEAVE_HTTP__AUTH__ALLOW_INSECURE_HTTP": "True",
+        "STRATOWEAVE_HTTP__AUTH__LOCAL__USERNAME": "admin",
+        "STRATOWEAVE_HTTP__AUTH__LOCAL__PASSWORD_HASH_FILE": "hash"})
+    testing.assertTrue(configured.http_auth.enabled())
+    testing.assertEqual(configured.http_auth.local_username, "admin")
+
+
+def _test_auth_redirect_and_cookie_inputs():
+    for target in ["https://evil.example", "//evil.example", "/%2fevil.example", "/\\evil.example", "/%5cevil.example", "/a\r\nLocation:evil", "/auth/logout", "/%61uth/oidc/login", "/./auth/oidc/login", "/%09/evil.example", "/safe%00unsafe"]:
+        testing.assertEqual(auth.safe_return_to(target), "/")
+    testing.assertEqual(auth.safe_return_to("/devices?name=a#details"), "/devices?name=a#details")
+    testing.assertEqual(auth.cookie_value("a=1; session=secret; b=2", "session"), "secret")
+    testing.assertTrue(auth.cookie_value("session=first; session=second", "session") is None)
+    testing.assertTrue(auth.cookie_value("unrelated=secret", "session") is None)
+
+
+def _test_local_hash_configuration_validation():
+    valid = "$2y$04$abcdefghijklmnopqrstuuCi15uRb1eH7NAlJ/TgeJertyknQpYn2"
+    testing.assertTrue(auth.valid_password_hash(valid))
+    for invalid in ["plaintext", valid + " ", valid[:6] + "!" + valid[7:], "$2y$99$" + valid[7:], "$2y$aa$" + valid[7:]]:
+        testing.assertFalse(auth.valid_password_hash(invalid))
+
+
+def _body_string(body: str, key: str) -> str:
+    value = json.decode(body)
+    if isinstance(value, dict):
+        result = value.get(key)
+        if isinstance(result, str):
+            return result
+    raise ValueError("Missing JSON string field " + key)
+
+
+actor _test_local_login_session_csrf_rotation_logout(t: testing.EnvT):
+    # Known bcrypt fixture for password "abc"; deliberately low cost for tests.
+    password_hash = "$2y$04$abcdefghijklmnopqrstuuCi15uRb1eH7NAlJ/TgeJertyknQpYn2"
+    settings = auth.Settings(public_origin="https://app.example", local_username="admin", local_password_hash_file="unused")
+    service = auth.Auth(settings, local_password_hash=password_hash)
+    var pre_cookie = ""
+    var auth_cookie = ""
+    var csrf = ""
+
+    def fail(exc: Exception):
+        t.failure(exc)
+
+    def protected(ctx: http_router.Context, respond: proc(int, dict[str, str], str) -> None):
+        subject = ctx.get("auth.subject")
+        if isinstance(subject, str):
+            testing.assertEqual(subject, "local:admin")
+        else:
+            raise ValueError("Missing authenticated identity")
+        respond(200, {}, "protected")
+
+    def after_logout(status: int, headers: dict[str, str], body: str):
+        try:
+            testing.assertEqual(status, 200)
+            testing.assertTrue("Max-Age=0" in headers.get_def("Set-Cookie", ""))
+            def revoked(status: int, headers: dict[str, str], body: str):
+                try:
+                    testing.assertEqual(status, 401)
+                    t.success()
+                except Exception as exc:
+                    fail(exc)
+            service.protect(_context("GET", "/private", {"cookie": auth_cookie}), revoked, protected)
+        except Exception as exc:
+            fail(exc)
+
+    def after_mutation(status: int, headers: dict[str, str], body: str):
+        try:
+            testing.assertEqual(status, 200)
+            testing.assertEqual(headers.get("Cache-Control"), "no-store")
+            service.logout(_context("POST", "/auth/logout", {"cookie": auth_cookie, "origin": "https://app.example", "x-csrf-token": csrf}), after_logout)
+        except Exception as exc:
+            fail(exc)
+
+    def after_bad_origin(status: int, headers: dict[str, str], body: str):
+        try:
+            testing.assertEqual(status, 403)
+            service.protect(_context("POST", "/private", {"cookie": auth_cookie, "origin": "https://app.example", "x-csrf-token": csrf}), after_mutation, protected)
+        except Exception as exc:
+            fail(exc)
+
+    def after_missing_csrf(status: int, headers: dict[str, str], body: str):
+        try:
+            testing.assertEqual(status, 403)
+            service.protect(_context("POST", "/private", {"cookie": auth_cookie, "origin": "https://evil.example", "x-csrf-token": csrf}), after_bad_origin, protected)
+        except Exception as exc:
+            fail(exc)
+
+    def after_login(status: int, headers: dict[str, str], body: str):
+        try:
+            testing.assertEqual(status, 200)
+            cookie = headers.get_def("Set-Cookie", "")
+            testing.assertTrue("Secure" in cookie and "HttpOnly" in cookie and "SameSite=Strict" in cookie)
+            auth_cookie = cookie.split(";", 1)[0]
+            testing.assertTrue(auth_cookie != pre_cookie, "Login must rotate the session identifier")
+            old_csrf = csrf
+            csrf = _body_string(body, "csrf_token")
+            testing.assertTrue(csrf != old_csrf)
+            testing.assertFalse("access_token" in body or "refresh_token" in body or "id_token" in body)
+            service.protect(_context("POST", "/private", {"cookie": auth_cookie, "origin": "https://app.example"}), after_missing_csrf, protected)
+        except Exception as exc:
+            fail(exc)
+
+    def after_nul_password(status: int, headers: dict[str, str], body: str):
+        try:
+            testing.assertEqual(status, 400)
+            service.local_login(_context("POST", "/auth/local/login", {"cookie": pre_cookie, "origin": "https://app.example", "x-csrf-token": csrf}, b'{"username":"admin","password":"abc"}'), after_login)
+        except Exception as exc:
+            fail(exc)
+
+    def after_duplicate_json(status: int, headers: dict[str, str], body: str):
+        try:
+            testing.assertEqual(status, 400)
+            service.local_login(_context("POST", "/auth/local/login", {"cookie": pre_cookie, "origin": "https://app.example", "x-csrf-token": csrf}, b'{"username":"admin","password":"abc\\u0000ignored"}'), after_nul_password)
+        except Exception as exc:
+            fail(exc)
+
+    def after_wrong_password(status: int, headers: dict[str, str], body: str):
+        try:
+            testing.assertEqual(status, 401)
+            service.local_login(_context("POST", "/auth/local/login", {"cookie": pre_cookie, "origin": "https://app.example", "x-csrf-token": csrf}, b'{"username":"wrong","username":"admin","password":"abc"}'), after_duplicate_json)
+        except Exception as exc:
+            fail(exc)
+
+    def after_bootstrap(status: int, headers: dict[str, str], body: str):
+        try:
+            testing.assertEqual(status, 200)
+            cookie = headers.get_def("Set-Cookie", "")
+            testing.assertTrue(cookie.startswith("__Host-stratoweave-session="))
+            testing.assertTrue("Secure" in cookie and "HttpOnly" in cookie and "SameSite=Lax" in cookie)
+            pre_cookie = cookie.split(";", 1)[0]
+            csrf = _body_string(body, "csrf_token")
+            service.local_login(_context("POST", "/auth/local/login", {"cookie": pre_cookie, "origin": "https://app.example", "x-csrf-token": csrf}, b'{"username":"admin","password":"wrong"}'), after_wrong_password)
+        except Exception as exc:
+            fail(exc)
+
+    service.session_status(_context("GET", "/auth/session"), after_bootstrap)
+
+
+actor _test_local_login_requires_bootstrap_csrf(t: testing.EnvT):
+    settings = auth.Settings(public_origin="https://app.example", local_username="admin", local_password_hash_file="unused")
+    service = auth.Auth(settings, local_password_hash="$2y$04$abcdefghijklmnopqrstuuCi15uRb1eH7NAlJ/TgeJertyknQpYn2")
+    def done(status: int, headers: dict[str, str], body: str):
+        try:
+            testing.assertEqual(status, 403)
+            t.success()
+        except Exception as exc:
+            t.failure(exc)
+    service.local_login(_context("POST", "/auth/local/login", {"origin": "https://app.example"}, b'{"username":"admin","password":"abc"}'), done)
+
+
+actor _test_disabled_auth_passes_through(t: testing.EnvT):
+    service = auth.Auth(auth.Settings())
+    def protected(ctx: http_router.Context, respond: proc(int, dict[str, str], str) -> None):
+        respond(200, {}, "ok")
+    def done(status: int, headers: dict[str, str], body: str):
+        try:
+            testing.assertEqual(status, 200)
+            testing.assertEqual(body, "ok")
+            t.success()
+        except Exception as exc:
+            t.failure(exc)
+    service.protect(_context("POST", "/private"), done, protected)

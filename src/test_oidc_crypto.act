@@ -1,0 +1,34 @@
+import testing
+import oidc_crypto
+
+def _test_pkce_rfc7636_vector():
+    testing.assertEqual(oidc_crypto.challenge("dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk"), "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM")
+
+def _test_secure_tokens_and_comparison():
+    a = oidc_crypto.random_token()
+    b = oidc_crypto.random_token()
+    testing.assertEqual(len(a), 43)
+    testing.assertTrue(a != b)
+    testing.assertTrue(oidc_crypto.constant_time_equal(a, a))
+    testing.assertFalse(oidc_crypto.constant_time_equal(a, b))
+    testing.assertFalse(oidc_crypto.constant_time_equal(a, a + "x"))
+
+def _test_bcrypt_verification():
+    stored = "$2y$04$abcdefghijklmnopqrstuuCi15uRb1eH7NAlJ/TgeJertyknQpYn2"
+    testing.assertTrue(oidc_crypto.verify_password("abc", stored))
+    testing.assertFalse(oidc_crypto.verify_password("abd", stored))
+    # Acton's JSON-to-str conversion truncates embedded NUL. Reject the raw
+    # document before conversion; the authentication endpoint uses this guard.
+    testing.assertFalse(oidc_crypto.json_document_valid(b'{"password":"abc\\u0000ignored"}'))
+    testing.assertFalse(oidc_crypto.verify_password("a" * 73, stored))
+    testing.assertFalse(oidc_crypto.verify_password("abc", "abc"))
+
+def _test_strict_base64url():
+    testing.assertEqual(oidc_crypto.decode_base64url("YWJj"), b"abc")
+    for bad in ["=", "a", "ab", "YWJj=", "YW Jj", "YWJj+"]:
+        try:
+            oidc_crypto.decode_base64url(bad)
+        except ValueError:
+            pass
+        else:
+            raise ValueError("Expected invalid base64url rejection")

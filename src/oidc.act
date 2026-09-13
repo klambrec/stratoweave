@@ -1,0 +1,574 @@
+"""Confidential OIDC Authorization Code client for server-side sessions.
+
+Only code flow with S256 PKCE and signed RS256 ID tokens is supported.
+All provider responses and credentials stay inside backend actors.
+"""
+import base64
+import http
+import http_router
+import json
+import logging
+import net
+import time
+import uri
+import oidc_crypto as crypto
+
+
+class PermanentError(Exception):
+    """Invalid credentials, rejected grant, or invalid provider response."""
+    pass
+
+class TemporaryError(Exception):
+    """A provider/network failure which may succeed on a later request."""
+    pass
+
+class UnknownKey(PermanentError):
+    pass
+
+
+class Endpoint(value):
+    scheme: str
+    host: str
+    authority: str
+    port: int
+    path: str
+    query: ?str
+
+    def __init__(self, scheme: str, host: str, authority: str, port: int, path: str, query: ?str):
+        self.scheme = scheme
+        self.host = host
+        self.authority = authority
+        self.port = port
+        self.path = path
+        self.query = query
+
+
+def is_local_host(host: str) -> bool:
+    return host == "localhost" or host.endswith(".localhost") or host == "127.0.0.1" or host == "::1"
+
+
+def endpoint(url: str, allow_insecure_http: bool=False) -> Endpoint:
+    if len(url) > 4096 or "\\" in url or "#" in url:
+        raise PermanentError("Invalid OIDC endpoint")
+    for c in url:
+        if ord(c) <= 32 or ord(c) >= 127:
+            raise PermanentError("Invalid OIDC endpoint")
+    parts = url.split("://", 1)
+    if len(parts) != 2:
+        raise PermanentError("Invalid OIDC endpoint")
+    scheme = parts[0]
+    query_parts = parts[1].split("?", 1)
+    query: ?str = None
+    if len(query_parts) == 2:
+        query = query_parts[1]
+    location = query_parts[0].split("/", 1)
+    authority = location[0]
+    path = "/" + location[1] if len(location) == 2 else "/"
+    if len(authority) == 0 or "@" in authority or "%" in authority:
+        raise PermanentError("Invalid OIDC endpoint authority")
+    host = authority
+    port_text = ""
+    if authority.startswith("["):
+        end = authority.find("]")
+        if end < 1:
+            raise PermanentError("Invalid OIDC endpoint host")
+        host = authority[1:end]
+        for c in host:
+            if c not in "0123456789abcdefABCDEF:":
+                raise PermanentError("Invalid OIDC endpoint host")
+        tail = authority[end+1:]
+        if tail:
+            if not tail.startswith(":"):
+                raise PermanentError("Invalid OIDC endpoint port")
+            port_text = tail[1:]
+            if not port_text:
+                raise PermanentError("Invalid OIDC endpoint port")
+    else:
+        host_parts = authority.split(":")
+        if len(host_parts) > 2:
+            raise PermanentError("Invalid OIDC endpoint authority")
+        host = host_parts[0]
+        if len(host_parts) == 2:
+            port_text = host_parts[1]
+            if not port_text:
+                raise PermanentError("Invalid OIDC endpoint port")
+        for c in host:
+            if c not in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789.-":
+                raise PermanentError("Invalid OIDC endpoint host")
+    if len(host) == 0:
+        raise PermanentError("Invalid OIDC endpoint host")
+    port = 443 if scheme == "https" else 80
+    if port_text:
+        port = 0
+        for c in port_text:
+            if c not in "0123456789":
+                raise PermanentError("Invalid OIDC endpoint port")
+            port = port * 10 + "0123456789".find(c)
+            if port > 65535:
+                raise PermanentError("Invalid OIDC endpoint port")
+        if port == 0:
+            raise PermanentError("Invalid OIDC endpoint port")
+    normalized_host: str = host.lower()
+    is_local = is_local_host(normalized_host)
+    if scheme != "https" and not (allow_insecure_http and is_local and scheme == "http"):
+        raise PermanentError("OIDC endpoints require HTTPS")
+    return Endpoint(scheme, host, authority, port, path, query)
+
+
+class Settings(value):
+    issuer: str
+    client_id: str
+    client_secret: str
+    redirect_uri: str
+    scopes: list[str]
+    allow_insecure_http: bool
+
+    def __init__(self, issuer: str, client_id: str, client_secret: str, redirect_uri: str, scopes: list[str], allow_insecure_http: bool=False):
+        self.issuer = issuer
+        self.client_id = client_id
+        self.client_secret = client_secret
+        self.redirect_uri = redirect_uri
+        self.scopes = list(scopes)
+        self.allow_insecure_http = allow_insecure_http
+        ep = endpoint(issuer, allow_insecure_http)
+        if ep.query is not None:
+            raise PermanentError("OIDC issuer must have no query")
+        callback = endpoint(redirect_uri, allow_insecure_http)
+        if callback.query is not None or not client_id or not client_secret:
+            raise PermanentError("Invalid OIDC client configuration")
+        if "openid" not in scopes:
+            raise PermanentError("OIDC requires the openid scope")
+        for scope in scopes:
+            if not scope or " " in scope or "\n" in scope or "\r" in scope:
+                raise PermanentError("Invalid OIDC scope")
+
+
+
+class TokenSet(value):
+    subject: str
+    name: str
+    email: str
+    issuer: str
+    expires_at: float
+    access_token: str
+    refresh_token: ?str
+    id_token: ?str
+    nonce: str
+    auth_time: ?int
+    audience: list[str]
+
+    def __init__(self, subject: str, name: str, email: str, issuer: str, expires_at: float, access_token: str, refresh_token: ?str, id_token: ?str, nonce: str, auth_time: ?int, audience: list[str]):
+        self.subject = subject
+        self.name = name
+        self.email = email
+        self.issuer = issuer
+        self.expires_at = expires_at
+        self.access_token = access_token
+        self.refresh_token = refresh_token
+        self.id_token = id_token
+        self.nonce = nonce
+        self.auth_time = auth_time
+        self.audience = audience
+
+
+class Metadata(value):
+    authorization: str
+    token: str
+    jwks: str
+    revocation: ?str
+    auth_method: str
+
+    def __init__(self, authorization: str, token: str, jwks: str, revocation: ?str, auth_method: str):
+        self.authorization = authorization
+        self.token = token
+        self.jwks = jwks
+        self.revocation = revocation
+        self.auth_method = auth_method
+
+
+def obj(value_: ?value) -> dict[str, ?value]:
+    if isinstance(value_, dict):
+        return value_
+    raise PermanentError("OIDC response must be a JSON object")
+
+def decode_json(data: bytes) -> dict[str, ?value]:
+    if not crypto.json_document_valid(data):
+        raise PermanentError("Invalid or ambiguous OIDC JSON")
+    return obj(json.decode(data.decode()))
+
+def string(data: dict[str, ?value], name: str, required: bool=True) -> str:
+    item = data.get(name)
+    if item is None and not required:
+        return ""
+    if isinstance(item, str) and (len(item) > 0 or not required) and len(item) <= 32768:
+        return item
+    raise PermanentError("Invalid OIDC string field")
+
+def strings(item: ?value) -> list[str]:
+    result: list[str] = []
+    if isinstance(item, list) and len(item) <= 128:
+        for x in item:
+            if isinstance(x, str) and len(x) > 0:
+                result.append(x)
+            else:
+                raise PermanentError("Invalid OIDC string array")
+        return result
+    raise PermanentError("Invalid OIDC string array")
+
+def number(data: dict[str, ?value], name: str) -> int:
+    item = data.get(name)
+    if isinstance(item, int):
+        return item
+    raise PermanentError("Invalid OIDC numeric field")
+
+def metadata(data: dict[str, ?value], settings: Settings) -> Metadata:
+    if string(data, "issuer") != settings.issuer:
+        raise PermanentError("OIDC discovery issuer mismatch")
+    if "code" not in strings(data.get("response_types_supported")) or "S256" not in strings(data.get("code_challenge_methods_supported")):
+        raise PermanentError("OIDC provider must support code flow and S256 PKCE")
+    if "RS256" not in strings(data.get("id_token_signing_alg_values_supported")):
+        raise PermanentError("OIDC provider must support RS256")
+    methods = strings(data.get("token_endpoint_auth_methods_supported")) if "token_endpoint_auth_methods_supported" in data else ["client_secret_basic"]
+    method = "client_secret_basic" if "client_secret_basic" in methods else "client_secret_post"
+    if method not in methods:
+        raise PermanentError("OIDC provider lacks supported confidential client authentication")
+    authorization = string(data, "authorization_endpoint")
+    token = string(data, "token_endpoint")
+    jwks = string(data, "jwks_uri")
+    revocation = string(data, "revocation_endpoint", False)
+    for url in [authorization, token, jwks] + ([revocation] if revocation else []):
+        endpoint(url, settings.allow_insecure_http)
+    return Metadata(authorization, token, jwks, revocation if revocation else None, method)
+
+
+def token_parts(raw: str) -> (dict[str, ?value], dict[str, ?value], bytes, bytes):
+    if len(raw) > 32768:
+        raise PermanentError("OIDC ID token is too large")
+    parts = raw.split(".")
+    if len(parts) != 3:
+        raise PermanentError("Invalid OIDC ID token")
+    header = decode_json(crypto.decode_base64url(parts[0]))
+    claims = decode_json(crypto.decode_base64url(parts[1]))
+    if string(header, "alg") != "RS256" or "crit" in header or "jku" in header or "jwk" in header or "x5u" in header or "b64" in header:
+        raise PermanentError("Unsupported OIDC ID token header")
+    return header, claims, (parts[0] + "." + parts[1]).encode(), crypto.decode_base64url(parts[2])
+
+
+def validate_id_token(raw: str, keys: list[dict[str, ?value]], settings: Settings, nonce: str, now: int, original: ?TokenSet=None) -> dict[str, ?value]:
+    header, claims, signed, signature = token_parts(raw)
+    kid = string(header, "kid", False)
+    matching: list[dict[str, ?value]] = []
+    for key in keys:
+        if string(key, "kty", False) == "RSA" and (not kid or string(key, "kid", False) == kid) and ("use" not in key or string(key, "use", False) == "sig") and ("alg" not in key or string(key, "alg", False) == "RS256"):
+            if "key_ops" not in key or "verify" in strings(key.get("key_ops")):
+                matching.append(key)
+    if len(matching) == 0:
+        raise UnknownKey("OIDC signing key is unavailable")
+    if len(matching) != 1:
+        raise PermanentError("OIDC signing key is ambiguous")
+    key = matching[0]
+    if not crypto.verify_rs256(signed, signature, crypto.decode_base64url(string(key, "n")), crypto.decode_base64url(string(key, "e"))):
+        raise PermanentError("Invalid OIDC signature")
+    if string(claims, "iss") != settings.issuer:
+        raise PermanentError("OIDC token issuer mismatch")
+    subject = string(claims, "sub")
+    aud = claims.get("aud")
+    audiences: list[str] = [aud] if isinstance(aud, str) else strings(aud)
+    # No additional audiences have been configured as trusted.
+    if audiences != [settings.client_id]:
+        raise PermanentError("OIDC token audience mismatch")
+    if "azp" in claims and string(claims, "azp") != settings.client_id:
+        raise PermanentError("OIDC token authorized party mismatch")
+    if number(claims, "exp") <= now or number(claims, "iat") > now + 60 or number(claims, "iat") < 0:
+        raise PermanentError("OIDC ID token has invalid timestamps")
+    if "nbf" in claims and number(claims, "nbf") > now + 60:
+        raise PermanentError("OIDC ID token is not yet valid")
+    if original is None or "nonce" in claims:
+        if not crypto.constant_time_equal(string(claims, "nonce"), nonce):
+            raise PermanentError("OIDC nonce mismatch")
+    if "auth_time" in claims and number(claims, "auth_time") > now + 60:
+        raise PermanentError("OIDC authentication time is invalid")
+    if original is not None:
+        if subject != original.subject or audiences != original.audience:
+            raise PermanentError("OIDC refresh changed identity")
+        if "auth_time" in claims and (original.auth_time is None or number(claims, "auth_time") != original.auth_time!):
+            raise PermanentError("OIDC refresh changed authentication time")
+    return claims
+
+
+actor Request(cap: net.TCPConnectCap, url: str, method: str, body: bytes, headers: dict[str, str], allow_insecure_http: bool, done: action(?dict[str, ?value], ?Exception) -> None):
+    """One bounded HTTP exchange; never follows redirects or logs data."""
+    parsed = endpoint(url, allow_insecure_http)
+    host = parsed.host
+    port = parsed.port
+    path = parsed.path
+    target = path + ("?" + parsed.query! if parsed.query is not None else "")
+    req_headers: dict[str, str] = {k: v for k, v in headers.items()}
+    req_headers["Accept"] = "application/json"
+    req_headers["Connection"] = "close"
+    wire = http.build_request(parsed.authority, method.encode(), target.encode(), b"1.1", req_headers, body)
+    var finished = False
+    var buf = b""
+    var tcp: ?net.TCPConnection = None
+    var tls: ?net.TLSConnection = None
+
+    def finish(result: ?dict[str, ?value], error: ?Exception):
+        if finished:
+            return
+        finished = True
+        buf = b""
+        if tcp is not None:
+            tcp.close(lambda _c: None)
+        if tls is not None:
+            tls.close(lambda _c: None)
+        done(result, error)
+
+    def receive(data: bytes):
+        if finished:
+            return
+        if len(buf) + len(data) > 262144:
+            finish(None, PermanentError("OIDC provider response too large"))
+            return
+        buf += data
+        try:
+            split = buf.split(b"\r\n\r\n", 1)
+            if len(split) == 1:
+                if len(buf) > 16384:
+                    finish(None, PermanentError("OIDC provider headers too large"))
+                return
+            if len(split[0]) > 16384:
+                raise PermanentError("OIDC provider headers too large")
+            # Close-delimited bodies are parsed only after EOF.
+            lower = split[0].lower()
+            if lower.find(b"\r\ncontent-length:") < 0 and lower.find(b"\r\ntransfer-encoding:") < 0:
+                return
+            response, rest = http.parse_response(buf, logging.Logger(None))
+            if response is not None:
+                accept(response)
+        except Exception:
+            finish(None, PermanentError("Invalid OIDC HTTP response"))
+
+    def accept(response: http.Response):
+        if response.status == 429 or response.status >= 500:
+            finish(None, TemporaryError("OIDC provider is unavailable"))
+            return
+        if response.status < 200 or response.status >= 300:
+            # Error descriptions may echo codes or secrets; never forward them.
+            finish(None, PermanentError("OIDC provider rejected HTTP request with status " + str(response.status)))
+            return
+        try:
+            result = decode_json(response.body)
+            if "error" in result:
+                finish(None, PermanentError("OIDC provider rejected the request"))
+            else:
+                finish(result, None)
+        except Exception:
+            finish(None, PermanentError("Invalid OIDC JSON response"))
+
+    def remote_close():
+        if finished:
+            return
+        try:
+            split = buf.split(b"\r\n\r\n", 1)
+            if len(split) == 2 and split[0].lower().find(b"\r\ncontent-length:") < 0 and split[0].lower().find(b"\r\ntransfer-encoding:") < 0:
+                framed = split[0] + b"\r\nContent-Length: " + str(len(split[1])).encode() + b"\r\n\r\n" + split[1]
+                response, rest = http.parse_response(framed, logging.Logger(None))
+                if response is not None:
+                    accept(response)
+                    return
+        except Exception:
+            pass
+        finish(None, TemporaryError("OIDC connection closed before a complete response"))
+
+    def tcp_connected(c: net.TCPConnection):
+        if not finished:
+            c.write(wire)
+    def tls_connected(c: net.TLSConnection):
+        if not finished:
+            c.write(wire)
+    def tcp_received(c: net.TCPConnection, data: bytes):
+        receive(data)
+    def tls_received(c: net.TLSConnection, data: bytes):
+        receive(data)
+    def tcp_failed(c: net.TCPConnection, error: str):
+        finish(None, TemporaryError("OIDC connection failed"))
+    def tls_failed(c: net.TLSConnection, error: str):
+        finish(None, TemporaryError("OIDC TLS connection failed"))
+    def tcp_closed(c: net.TCPConnection):
+        remote_close()
+    def tls_closed(c: net.TLSConnection):
+        remote_close()
+
+    if parsed.scheme == "https":
+        tls = net.TLSConnection(cap, host, port, tls_connected, tls_received, tls_failed, tls_closed, True)
+    else:
+        tcp = net.TCPConnection(cap, host, port, tcp_connected, tcp_received, tcp_failed, tcp_closed, connect_timeout=10.0)
+    after 10: finish(None, TemporaryError("OIDC provider request timed out"))
+
+
+actor Provider(cap: net.TCPConnectCap, settings: Settings, log_handler: ?logging.Handler=None):
+    log = logging.Logger(log_handler)
+    var cached_metadata: ?Metadata = None
+    var metadata_time = 0
+    var metadata_pending: list[action(?Metadata, ?Exception) -> None] = []
+    var keys: list[dict[str, ?value]] = []
+    var key_time = 0
+    var key_pending: list[action(?Exception) -> None] = []
+
+    def discover(done: action(?Metadata, ?Exception) -> None):
+        if cached_metadata is not None and time.time().unix_s() - metadata_time < 3600:
+            done(cached_metadata, None)
+            return
+        metadata_pending.append(done)
+        if len(metadata_pending) > 1:
+            return
+        def received(data: ?dict[str, ?value], error: ?Exception):
+            result: ?Metadata = None
+            failure = error
+            if data is not None and error is None:
+                try:
+                    result = metadata(data, settings)
+                    cached_metadata = result
+                    metadata_time = time.time().unix_s()
+                except Exception:
+                    failure = PermanentError("Invalid OIDC discovery document")
+            callbacks = metadata_pending
+            metadata_pending = []
+            for callback in callbacks:
+                callback(result, failure)
+        Request(cap, settings.issuer.rstrip("/") + "/.well-known/openid-configuration", "GET", b"", {}, settings.allow_insecure_http, received)
+
+    def load_keys(meta: Metadata, done: action(?Exception) -> None):
+        key_pending.append(done)
+        if len(key_pending) > 1:
+            return
+        def received(data: ?dict[str, ?value], error: ?Exception):
+            failure = error
+            if data is not None and error is None:
+                try:
+                    raw = data.get("keys")
+                    parsed_keys: list[dict[str, ?value]] = []
+                    if isinstance(raw, list) and len(raw) > 0 and len(raw) <= 32:
+                        for key in raw:
+                            parsed_keys.append(obj(key))
+                    else:
+                        raise PermanentError("Invalid OIDC key set")
+                    keys = parsed_keys
+                    key_time = time.time().unix_s()
+                except Exception:
+                    failure = PermanentError("Invalid OIDC key set")
+            callbacks = key_pending
+            key_pending = []
+            for callback in callbacks:
+                callback(failure)
+        Request(cap, meta.jwks, "GET", b"", {}, settings.allow_insecure_http, received)
+
+    def begin(state: str, nonce: str, verifier: str, done: action(?str, ?Exception) -> None):
+        def ready(meta: ?Metadata, error: ?Exception):
+            if meta is None or error is not None:
+                done(None, error)
+                return
+            params = {"response_type": "code", "client_id": settings.client_id, "redirect_uri": settings.redirect_uri, "scope": " ".join(settings.scopes), "state": state, "nonce": nonce, "code_challenge": crypto.challenge(verifier), "code_challenge_method": "S256"}
+            if "offline_access" in settings.scopes:
+                params["prompt"] = "consent"
+            separator = "&" if "?" in meta!.authorization else "?"
+            done(meta!.authorization + separator + http_router.form_encode(params), None)
+        discover(ready)
+
+    def credentials(meta: Metadata, form: dict[str, str]) -> dict[str, str]:
+        headers = {"Content-Type": "application/x-www-form-urlencoded"}
+        if meta.auth_method == "client_secret_basic":
+            # OAuth Basic encodes both fields before joining with a colon.
+            user = uri.quote(settings.client_id, "")
+            secret = uri.quote(settings.client_secret, "")
+            headers["Authorization"] = "Basic " + base64.encode((user + ":" + secret).encode()).decode()
+        else:
+            form["client_id"] = settings.client_id
+            form["client_secret"] = settings.client_secret
+        return headers
+
+    def exchange(code: str, nonce: str, verifier: str, done: action(?TokenSet, ?Exception) -> None):
+        grant({"grant_type": "authorization_code", "code": code, "redirect_uri": settings.redirect_uri, "code_verifier": verifier}, nonce, None, done)
+
+    def refresh(tokens: TokenSet, done: action(?TokenSet, ?Exception) -> None):
+        if tokens.refresh_token is None:
+            done(None, PermanentError("OIDC session cannot be refreshed"))
+            return
+        grant({"grant_type": "refresh_token", "refresh_token": tokens.refresh_token!}, tokens.nonce, tokens, done)
+
+    def grant(form: dict[str, str], nonce: str, original: ?TokenSet, complete: action(?TokenSet, ?Exception) -> None):
+        def done(tokens: ?TokenSet, error: ?Exception):
+            if error is not None:
+                # These exception classes contain only our fixed messages and
+                # numeric HTTP status. Never log arbitrary exceptions or data.
+                if isinstance(error, PermanentError) or isinstance(error, TemporaryError):
+                    log.warning("OIDC token exchange failed", {"reason": str(error)})
+                else:
+                    log.warning("OIDC token exchange failed unexpectedly", None)
+            complete(tokens, error)
+        def ready(meta: ?Metadata, error: ?Exception):
+            if meta is None or error is not None:
+                done(None, error)
+                return
+            headers = credentials(meta!, form)
+            def received(data: ?dict[str, ?value], failure: ?Exception):
+                if data is None or failure is not None:
+                    done(None, failure)
+                    return
+                def accepted(keys_error: ?Exception):
+                    if keys_error is not None:
+                        done(None, keys_error)
+                        return
+                    try:
+                        done(accept_tokens(data!, nonce, original), None)
+                    except PermanentError as error:
+                        done(None, error)
+                    except Exception:
+                        done(None, PermanentError("Invalid OIDC token response"))
+                try:
+                    if len(keys) == 0 or time.time().unix_s() - key_time >= 3600:
+                        load_keys(meta!, accepted)
+                    else:
+                        result = accept_tokens(data!, nonce, original)
+                        done(result, None)
+                except UnknownKey:
+                    if time.time().unix_s() - key_time >= 5:
+                        load_keys(meta!, accepted)
+                    else:
+                        done(None, PermanentError("Unknown OIDC signing key"))
+                except PermanentError as error:
+                    done(None, error)
+                except Exception:
+                    done(None, PermanentError("Invalid OIDC token response"))
+            Request(cap, meta!.token, "POST", http_router.form_encode(form).encode(), headers, settings.allow_insecure_http, received)
+        discover(ready)
+
+    def accept_tokens(data: dict[str, ?value], nonce: str, original: ?TokenSet) -> TokenSet:
+        now = time.time().unix_s()
+        access = string(data, "access_token")
+        if string(data, "token_type").lower() != "bearer":
+            raise PermanentError("Unsupported OIDC token type")
+        expires = number(data, "expires_in")
+        if expires <= 0 or expires > 31536000:
+            raise PermanentError("Invalid OIDC token expiry")
+        raw = string(data, "id_token", original is None)
+        refresh_value = string(data, "refresh_token", False)
+        refresh_token: ?str = refresh_value if refresh_value else (original.refresh_token if original is not None else None)
+        if not raw and original is not None:
+            return TokenSet(original.subject, original.name, original.email, original.issuer, float(now + expires), access, refresh_token, original.id_token, nonce, original.auth_time, original.audience)
+        claims = validate_id_token(raw, keys, settings, nonce, now, original)
+        if "at_hash" in claims and not crypto.constant_time_equal(string(claims, "at_hash"), crypto.base64url(crypto.sha256(access.encode())[:16])):
+            raise PermanentError("OIDC access token hash mismatch")
+        auth_time: ?int = number(claims, "auth_time") if "auth_time" in claims else (original.auth_time if original is not None else None)
+        return TokenSet(string(claims, "sub"), string(claims, "name", False), string(claims, "email", False), settings.issuer, float(now + expires), access, refresh_token, raw, nonce, auth_time, [settings.client_id])
+
+    def revoke(tokens: TokenSet):
+        # Local session removal is authoritative. Revocation is best effort,
+        # provider-specific and strictly back-channel; no token-bearing logout URL.
+        def ready(meta: ?Metadata, error: ?Exception):
+            if meta is not None and error is None and meta!.revocation is not None:
+                token = tokens.refresh_token! if tokens.refresh_token is not None else tokens.access_token
+                form = {"token": token, "token_type_hint": "refresh_token" if tokens.refresh_token is not None else "access_token"}
+                headers = credentials(meta!, form)
+                Request(cap, meta!.revocation!, "POST", http_router.form_encode(form).encode(), headers, settings.allow_insecure_http, lambda data, error: None)
+        discover(ready)

@@ -3,6 +3,7 @@ import http_router
 import json
 import logging
 import net
+import auth as swauth
 
 import device as swdev
 import restconf as swrestconf
@@ -44,7 +45,10 @@ actor HttpServer(
     restconf_root: str = "/restconf",
     address: str = "::",
     port: int = 80,
-    static_assets: ?dict[str, str] = None
+    static_assets: ?dict[str, str] = None,
+    authentication: ?swauth.Auth = None,
+    tls_certificate: ?bytes = None,
+    tls_private_key: ?bytes = None
 ):
     _ROUTER_CTX_DEVICE_KEY = "dev"
     http_log = logging.Logger(log_handler)
@@ -386,7 +390,7 @@ actor HttpServer(
         g.get("/diff", _router_handle_device_diff)
         g.get("/target", _router_handle_device_target)
         g.get("/running", _router_handle_device_running)
-        g.get("/resync", _router_handle_device_resync)
+        g.post("/resync", _router_handle_device_resync)
         g.get("/info", _router_handle_device_info)
         g.get("/log", _router_handle_device_log)
         g.get("/q", _router_handle_device_queue_list)
@@ -396,6 +400,15 @@ actor HttpServer(
     http_router_root = http_router.Router()
     http_router_root.use(http_router.access_log_middleware(http_log))
     http_router_root.use(http_router.recoverer_middleware(http_log))
+
+    # The API router is always protected, including application-specific routes.
+    # Static assets and auth bootstrap are registered on a separate public router.
+    if authentication is not None:
+        def authentication_middleware(next_handler: proc(http_router.Context, proc(int, dict[str, str], str) -> None) -> None):
+            def wrapped(ctx: http_router.Context, respond: proc(int, dict[str, str], str) -> None):
+                authentication.protect(ctx, respond, next_handler)
+            return wrapped
+        http_router_root.use(authentication_middleware)
 
     http_router_root.get("/config-queue", _router_handle_config_queue)
     http_router_root.get("/device", _router_handle_device_list)
@@ -410,11 +423,24 @@ actor HttpServer(
     if install_extra_routes is not None:
         install_extra_routes(http_router_root)
 
+    public_router = http_router.Router()
+    public_router.use(http_router.access_log_middleware(http_log))
+    public_router.use(http_router.recoverer_middleware(http_log))
+    if authentication is not None:
+        authentication.install(public_router)
     if static_assets is not None:
-        swstatic.install(http_router_root, static_assets)
+        swstatic.install(public_router, static_assets)
+
+    def serve_request(request: http.Request, respond: proc(int, dict[str, str], str) -> None):
+        # Only actual API route matches go through authentication. A public SPA
+        # fallback can never override an API route merely by accepting HTML.
+        if http_router_root.matches(request.method, request.path):
+            http_router_root.serve(request, respond)
+        else:
+            public_router.serve(request, respond)
 
     def _on_http_server_request(server, request, respond):
-        http_router_root.serve(request, respond)
+        serve_request(request, respond)
 
     def _on_http_accept(server):
         server.cb_install(_on_http_server_request, _on_http_server_error)
@@ -422,4 +448,18 @@ actor HttpServer(
     def _on_http_server_error(server, error):
         print("Error: {error}")
 
-    listener = http.Listener(listen_cap, address, port, _on_http_accept, log_handler=log_handler)
+    var listener: ?http.Listener = None
+    var tls_listener: ?http.TLSListener = None
+    # The low-level HTTP parser traces raw chunks. Router access logging is
+    # sufficient; authentication requests must never reach payload trace logs.
+    wire_log_handler = log_handler if authentication is None else None
+    if tls_certificate is not None and tls_private_key is not None:
+        def tls_request(server, request, respond):
+            serve_request(request, respond)
+        def tls_error(server, error):
+            http_log.error("HTTPS connection error")
+        def tls_accept(server):
+            server.cb_install(tls_request, tls_error)
+        tls_listener = http.TLSListener(listen_cap, address, port, tls_certificate, tls_private_key, tls_accept, log_handler=wire_log_handler)
+    else:
+        listener = http.Listener(listen_cap, address, port, _on_http_accept, log_handler=wire_log_handler)

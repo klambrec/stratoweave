@@ -1,5 +1,6 @@
 .build
 build.zig*
+!deps/oidc_crypto_headers/build.zig
 .acton.lock
 .acton.compile.lock
 .actonc.lock

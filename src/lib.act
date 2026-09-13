@@ -7,12 +7,15 @@ import net
 import tmf.cfs
 
 import app as swapp
+import auth as swauth
 import db as swdb
 import db.etcd as swetcd
 import db.lmdb as swlmdb
 import device as swdev
 import http_server as swhttp
 import netconf_server as swnetconf
+import oidc
+import oidc_crypto
 import test_rig as swts
 
 
@@ -102,6 +105,39 @@ def _start(sysspec: swapp.SysSpec, env: Env,
     fcap = file.FileCap(env.cap)
     rfcap = file.ReadFileCap(fcap)
 
+    def read_secret(path: str) -> str:
+        try:
+            f = file.ReadFile(rfcap, path)
+            data = f.read()
+            f.close()
+            result = data.decode().rstrip("\r\n")
+            if result == "":
+                raise ValueError("Empty secret file")
+            return result
+        except Exception:
+            raise argconf.ConfigurationError("Cannot read a nonempty HTTP authentication/TLS file: " + path)
+
+    auth_settings = system_settings.http_auth
+    if http and auth_settings.enabled() and oidc_crypto.durable_runtime_enabled():
+        raise argconf.ConfigurationError("HTTP authentication is unsupported in durable-runtime builds; browser sessions must remain process-local")
+    local_password_hash: ?str = None
+    oidc_client_secret: ?str = None
+    tls_certificate: ?bytes = None
+    tls_private_key: ?bytes = None
+    local_hash_path = auth_settings.local_password_hash_file
+    if http and local_hash_path is not None:
+        local_password_hash = read_secret(local_hash_path)
+        if not swauth.valid_password_hash(local_password_hash!):
+            raise argconf.ConfigurationError("HTTP local password_hash_file must contain a valid bcrypt hash ($2b$ or $2y$, cost 4..16)")
+    client_secret_path = auth_settings.client_secret_file
+    if http and client_secret_path is not None:
+        oidc_client_secret = read_secret(client_secret_path)
+    certificate_path = system_settings.http_tls_certificate_file
+    key_path = system_settings.http_tls_private_key_file
+    if http and certificate_path is not None and key_path is not None:
+        tls_certificate = read_secret(certificate_path).encode()
+        tls_private_key = read_secret(key_path).encode()
+
     logh = logging.Handler("SWeave")
     logh.add_sink(logging.StdoutSink())
     logh.set_output_level(logging.TRACE)
@@ -145,7 +181,14 @@ def _start(sysspec: swapp.SysSpec, env: Env,
         if http:
             tcpl_cap = net.TCPListenCap(net.TCPCap(net.NetCap(env.cap)))
             enable_tmf = len(tmf.cfs.services_from_schema(top_schema)) > 0
-            swhttp.HttpServer(tcpl_cap, top_schema=top_schema, cfs=cfs, dev_registry=dev_registry, schema_for_layer=sysspec.schema_for_layer, static_assets=static_assets, enable_tmf_api=enable_tmf, log_handler=logh_http, port=system_settings.http_port)
+            provider: ?oidc.Provider = None
+            if oidc_client_secret is not None:
+                provider = oidc.Provider(connect_cap, oidc.Settings(auth_settings.issuer, auth_settings.client_id, oidc_client_secret,
+                                                                  auth_settings.public_origin + "/auth/oidc/callback", auth_settings.scopes,
+                                                                  allow_insecure_http=auth_settings.allow_insecure_http), log_handler=logh_http)
+            auth = swauth.Auth(auth_settings, provider, local_password_hash)
+            swhttp.HttpServer(tcpl_cap, top_schema=top_schema, cfs=cfs, dev_registry=dev_registry, schema_for_layer=sysspec.schema_for_layer, static_assets=static_assets, enable_tmf_api=enable_tmf, log_handler=logh_http, port=system_settings.http_port,
+                              authentication=auth, tls_certificate=tls_certificate, tls_private_key=tls_private_key)
 
         if netconf:
             nc_listen_cap = net.TCPListenCap(net.TCPCap(net.NetCap(env.cap)))

@@ -1,0 +1,104 @@
+"""Signed RS256 fixtures exercise OIDC protocol security boundaries.
+
+Fixture signatures were generated with OpenSSL; the private key is discarded.
+All validation uses the fixed timestamp 1700000000, never the wall clock.
+"""
+import oidc
+import oidc_crypto
+import testing
+
+KEY: dict[str, ?value] = {"kty": "RSA", "kid": "fixture", "use": "sig", "alg": "RS256", "n": "36UFvuSafgy83v7ZWw5xM-UiJcaeLVkkMZGypIMBovtFyGVJIv1e7rwYUKEt0P-pzNT1FYRclEPh1t5tgjImL97JfMqHlkM-t6hyu4m7cMDUzHVcz9i9J2TzO8NuUybma64YUgZYbyL_ixM4O4xeqER5InAuxb_rHcYX6LeL_zcKTwKL6vj4iN2WUQc8twcESNI1f3p-hqJl3g3Knqe0ug9zu6Yh7Qy6YlcT238cVMNcaKBLus-WM5BHNsycOIxi7J7EoAlNLlItTkG8b-SOl4bFbsmuyKiOkd9XwFUxFpLdZWEKjjwgjYHkcMdKCaTtsbB9a9yAhM99HNfXoSvldQ", "e": "AQAB"}
+TOKENS = {
+    "valid": "eyJhbGciOiJSUzI1NiIsImtpZCI6ImZpeHR1cmUifQ.eyJpc3MiOiJodHRwczovL2lzc3Vlci5leGFtcGxlIiwic3ViIjoidXNlci0xMjMiLCJhdWQiOiJjbGllbnQiLCJleHAiOjE3MDAwMDAzMDAsImlhdCI6MTcwMDAwMDAwMCwibm9uY2UiOiJub25jZSIsImF1dGhfdGltZSI6MTY5OTk5OTk5MH0.QvbAdBsVNb-OynCevVbrBaNtCoUtag4CJtFLXym-RnpcRJ2FgL5fu2eNPTAHvKFM9XDU4csj6SADwxHDeE4r6WC9gXB7qE371mHOXv3Dm7KKt8lRKtDc-2-ROj_0X5f_8yr3PntDy24v1d8ncOorGHjj2xqcd4mtlAI8v2jfYgbbeRfkvzKcHypQl19173S_tfUNFdNMhrZqdsRF2BKJzjexw91i5ArV4YCXeE2psTMg21r3RTFMJfWpzvQiNRysU1-0vjMrAitGCp2-f-hTJK9eGc8-kyHDdJayS0gAFa0gOJSnT4mPuxwfU6JtMyfrNTuZIE7lHti_gYlkmLsuaQ",
+    "issuer": "eyJhbGciOiJSUzI1NiIsImtpZCI6ImZpeHR1cmUifQ.eyJpc3MiOiJodHRwczovL2F0dGFja2VyLmV4YW1wbGUiLCJzdWIiOiJ1c2VyLTEyMyIsImF1ZCI6ImNsaWVudCIsImV4cCI6MTcwMDAwMDMwMCwiaWF0IjoxNzAwMDAwMDAwLCJub25jZSI6Im5vbmNlIiwiYXV0aF90aW1lIjoxNjk5OTk5OTkwfQ.YV6BVfoxeFCVlULKfPXmJm-8qDSKNbxv1cYsqxd10in9Nu1PJqCfs-fRxbpf3m2R60eBpOvh9NotWcVb5atIgPJXGWckRFmDikDS9q6KPLrLxHkkYXs_OImpcgBks9Q1mOo5cpbtPyWfDIosz0fENQc83ijIrnRsO_-MVO_08Xyc8LpEGB9t7dHJb-6_x1fY-Cdic1RF0xX-8-BQvYCA32Twulp27yOMa9Sc9VclY2gYoJGhtnlqB0fx1hSfEUCI6_PNcLN1-SIqNY_naaMakpmCS1BXPWcNa1ot2DSpf3YuobAxMWD58kCqlG32xZAMXcxJ-D4sYpqP9Ev9y3US8A",
+    "audience": "eyJhbGciOiJSUzI1NiIsImtpZCI6ImZpeHR1cmUifQ.eyJpc3MiOiJodHRwczovL2lzc3Vlci5leGFtcGxlIiwic3ViIjoidXNlci0xMjMiLCJhdWQiOiJvdGhlciIsImV4cCI6MTcwMDAwMDMwMCwiaWF0IjoxNzAwMDAwMDAwLCJub25jZSI6Im5vbmNlIiwiYXV0aF90aW1lIjoxNjk5OTk5OTkwfQ.F-fDcOwvAt7qXQbM0ARytohJ9H8qXDS6nLotT8h56psabpGB5jmAPIIobskxkQ13LRjduRTNRSWJ8F5SYs03gca39sGJqDVdmk4EHhgcUQ3jmhJ80PsdeOihZGAVOUxEru4azk14GC6kc_payL67BFC8A5OxKMNODBQuYo1aoTVWmJWgOG3E8zPfA4fBWxppcDqGrTrPhF9tbUj-5kwSmtiUqatmmcHEUAf6ZBO5D2FmyKcoFgs5DMTHavnshBZ6zqWmGOmqThaYEIadfbSkwEScnSHZoUApzVuTuZWZIOw4X7oAyhvYXqiidIsy28qo32kJh24DWPTYtHpZhXhArA",
+    "extra_audience": "eyJhbGciOiJSUzI1NiIsImtpZCI6ImZpeHR1cmUifQ.eyJpc3MiOiJodHRwczovL2lzc3Vlci5leGFtcGxlIiwic3ViIjoidXNlci0xMjMiLCJhdWQiOlsiY2xpZW50Iiwib3RoZXIiXSwiZXhwIjoxNzAwMDAwMzAwLCJpYXQiOjE3MDAwMDAwMDAsIm5vbmNlIjoibm9uY2UiLCJhdXRoX3RpbWUiOjE2OTk5OTk5OTB9.xFYdFkV7PQ51UhhMqZN969UMCnMd886xRX5709tF9vmPBIs3cVPbXbTAAcMuN0seD1S__hxTknteu5Snn95Bt1jWozVAOS82XBD5XyNbYrUdW-K7vAukXQZYxEmIxTGGaZi3TZ-zqLnpcKE-_kq-tobigj0fq_ryJy16hWTAosR1TxHtAVW3pQnPotWQRGON3PgVBM9aVdobDBF3g_HCfui2dNPatvi90hksLjDfswnp1O0LhfcmfMCtrr6u1b--l-Pa6tHU81JAyUiP3IESmW8eenCO67dGEWrNMv9H_W_TufXi6E8H-saTfgzN5crMfrJgjYwV5NZ-2l2gkzpFGA",
+    "nonce": "eyJhbGciOiJSUzI1NiIsImtpZCI6ImZpeHR1cmUifQ.eyJpc3MiOiJodHRwczovL2lzc3Vlci5leGFtcGxlIiwic3ViIjoidXNlci0xMjMiLCJhdWQiOiJjbGllbnQiLCJleHAiOjE3MDAwMDAzMDAsImlhdCI6MTcwMDAwMDAwMCwibm9uY2UiOiJ3cm9uZyIsImF1dGhfdGltZSI6MTY5OTk5OTk5MH0.Mc_SfXBQTPqqSy_CJxzOZ8ggkvjg_c6NF04uStbGo8as7g6wnRRiltDZMaZifWn3L2EoSF4-AJtJ9ygAOqgjQodQ37R3w-r3L7azynAk3zfSXiHb3Tus5tg_GRfpJXRe0ow34a--CktYY21T9vruJY7wenj8GTi2E_RmtOyqNN2l7pggsqtA4Ta4J3ZEfX8BF4KUDVYyPpwA0goTngDyYoJloMLP1ohfPvAZMaV4evf6lJBmIOAWJJgbbT4ag_sFlgi-SSNy8KhAaVc_jt39VRdSB9H1RZC3Av_fKZBUAnxI7FNn49VaMr_21H2zT6c8SBRBNEjFelP_6WxDG_-R-g",
+    "expired": "eyJhbGciOiJSUzI1NiIsImtpZCI6ImZpeHR1cmUifQ.eyJpc3MiOiJodHRwczovL2lzc3Vlci5leGFtcGxlIiwic3ViIjoidXNlci0xMjMiLCJhdWQiOiJjbGllbnQiLCJleHAiOjE3MDAwMDAwMDAsImlhdCI6MTcwMDAwMDAwMCwibm9uY2UiOiJub25jZSIsImF1dGhfdGltZSI6MTY5OTk5OTk5MH0.RC1BIiufhsRS27JmBkTk9GTo5hXwmiq91LJc8maNrC7uMcd-Mj0my4E30I-M33W38h_9trWRZpqwGfMXo5AmtnAq2oApNF-qHV9WZHoq6ezTN4sgir8sEGdGOW8h2GnLqLsVjTkm-k1QYf4BhuO0KaOWSuOCAh-csHDnn9uAaKmtOSDf1pBM3L72FrcOLJA4CGYP6XUh1gGd5R7Z1uimlZeB4I0Z-YHInJHvbT1HusUnYU3KawHmGpLV3BZ4CqT54a6Ew-G7Wdz3I9aqct9ho-Zuea5UrhMNzn5fyJ0EvFObOYj7mvUFf6JrQ_FsvkZpumhh6w2UY6c8YagtQtzd4Q",
+    "future": "eyJhbGciOiJSUzI1NiIsImtpZCI6ImZpeHR1cmUifQ.eyJpc3MiOiJodHRwczovL2lzc3Vlci5leGFtcGxlIiwic3ViIjoidXNlci0xMjMiLCJhdWQiOiJjbGllbnQiLCJleHAiOjE3MDAwMDAzMDAsImlhdCI6MTcwMDAwMDA3MCwibm9uY2UiOiJub25jZSIsImF1dGhfdGltZSI6MTY5OTk5OTk5MH0.onYE5A_IdPjzfGWtbpvQ0bkdV2eLg3BgPVmtAqxo-Lw3-RarjWyM3q04MZ1qocSpaSvpdKiTPndi9XAjXlyVKH_0WFpQ22J9IkufS74T8XmONm92-71fBvr1a6O5Amo0gT-I95oOkYVqmOgg83agdJOaycjNfxeKN7owH-tc2OW0_34T3pGBHLOtU4ElDcV43D4oqelGcVsJRhxWDaC3yWhY_YVx95aeed_eHJkijKPM2oiLwhBv_QjGRj24Ig0Ht7_X4XRYjWmJ1eq2MxC7_Bsn1BASTa7ufpDSMEuCrZTqCg0Y-lEvVc5KKAnRvYYuXJCt_l3OKZbcdMB6GOLtjw",
+    "not_before": "eyJhbGciOiJSUzI1NiIsImtpZCI6ImZpeHR1cmUifQ.eyJpc3MiOiJodHRwczovL2lzc3Vlci5leGFtcGxlIiwic3ViIjoidXNlci0xMjMiLCJhdWQiOiJjbGllbnQiLCJleHAiOjE3MDAwMDAzMDAsImlhdCI6MTcwMDAwMDAwMCwibm9uY2UiOiJub25jZSIsImF1dGhfdGltZSI6MTY5OTk5OTk5MCwibmJmIjoxNzAwMDAwMDcwfQ.nj1alyR7AbkwOhzxs-yPRmh5alJ5BkGFL_h04klhWIEU3duQH2DJFYDC7FB-TYgS6U0fIAtWnQHclklNXHyekWdE1tFgzluFRL4wj2BTY1q5VLeMljTfmkW5VQkkz5-ITUt6QR2c4JzfB2CIpabD7-SY-zWvuxXfFm5PnvK5DvUmIf2Ma4HvZNHCGN-Om7L0GSH9pqTMZoOpqYglx4B9TKJC5w36foiKqIRqt69CPxZEDH_rBT5LYv4xhE8A7ncu3UG-OALqrK5fBvXqJBx-HBdzQqkZYJx_XZNxZ97NQ68uyEtYKRsl2BLk9nIUEGYnQs1nb4Ck8608Sgok0cDF0w",
+    "subject": "eyJhbGciOiJSUzI1NiIsImtpZCI6ImZpeHR1cmUifQ.eyJpc3MiOiJodHRwczovL2lzc3Vlci5leGFtcGxlIiwic3ViIjoiIiwiYXVkIjoiY2xpZW50IiwiZXhwIjoxNzAwMDAwMzAwLCJpYXQiOjE3MDAwMDAwMDAsIm5vbmNlIjoibm9uY2UiLCJhdXRoX3RpbWUiOjE2OTk5OTk5OTB9.D23xVxix1lsz1erpkau7EI9IRE7INWxBR7SuOiwAQwwROY-RN-TI7i4gGr7gEeDAEuLIjv2Wb-kLPc5AvBhL2vWXa_34erV2HyK7vtZ6TVsIffSrQB0HQolG355Bb83nI7Uap2I-17zvwt0pWlcs19_8CB8WJENLRG44SDP9-DxBx71pQ_z1utgFkFRSfh15BM-IagS510OayPzabToS581OjkKlysgKMUFl52MU9W7MeFeEsWezK1MmRAHrL6wUIbvBxfBMraHuGGm7zIZCYq6EwabdTmhPAHXQkceptJr3tJgvef35vA4-HtRr4-FmFPrmX-2c26m_T7a4-J1s0g",
+    "azp": "eyJhbGciOiJSUzI1NiIsImtpZCI6ImZpeHR1cmUifQ.eyJpc3MiOiJodHRwczovL2lzc3Vlci5leGFtcGxlIiwic3ViIjoidXNlci0xMjMiLCJhdWQiOiJjbGllbnQiLCJleHAiOjE3MDAwMDAzMDAsImlhdCI6MTcwMDAwMDAwMCwibm9uY2UiOiJub25jZSIsImF1dGhfdGltZSI6MTY5OTk5OTk5MCwiYXpwIjoib3RoZXIifQ.z2ASI1nJoWRPXcZxw8WlQxLvm4WnegLDWd2D6NzDKXcWeIks2supVfN1n49-g6RwiQ-8UaIsoDvoXAzM237z_Iplg2tMH8KrDsZKsFKk8pG6zWW1egqgm5oq1-O7NIQHUnwjctUgI3Xl4xcLJzIU4RfeiDsHLum_08rgYNncwp7eGTfwRS22gg4dmQRU0IPjQR442gHa-KYhg4h0vNPff0KPTKwFSgbQBy8rIGuARMNnpWapwAZhsLZWGrq_wOFvCc4BILnpooqlaLuELf0GBArka-Uw0jc7Le057r4cCafky7lLzu62kDJ00exTl0kjw8b6gOcBzdH7NES6AnS3kw",
+    "refresh_subject": "eyJhbGciOiJSUzI1NiIsImtpZCI6ImZpeHR1cmUifQ.eyJpc3MiOiJodHRwczovL2lzc3Vlci5leGFtcGxlIiwic3ViIjoic29tZW9uZS1lbHNlIiwiYXVkIjoiY2xpZW50IiwiZXhwIjoxNzAwMDAwMzAwLCJpYXQiOjE3MDAwMDAwMDAsIm5vbmNlIjoibm9uY2UiLCJhdXRoX3RpbWUiOjE2OTk5OTk5OTB9.0FwLJki1ACzYvJ37pIP94Cu8UYq4wTiTqMqaLzVtAmW0l3PD0w9xAaLdjmhagqIgJIK7giO2nSx-gr3nhExxXgd0i5myklrXWf2CzFb5i4C0xLz52Rl9KO1-sevLVi24FeiYW1LjLAHpgQtaame2fSH-JnfN0IcDKzzXYJNWEnQSkvdB3o2IJ3JEOjxCjlMKqIwKh9KYjlBue5cOoL44EqpjnDFg3QcrwAzL22gaaPdSu9FsAhNqMCrTpfWhimYbFNwbNllytzEtZM4Vy5WdR0Lo8OSXSROiW5jOdjg-WLXV4jr4AbTVWftqm5Tl2oiLhwEVx0uOqqokCx-cugu1mQ",
+    "refresh_auth_time": "eyJhbGciOiJSUzI1NiIsImtpZCI6ImZpeHR1cmUifQ.eyJpc3MiOiJodHRwczovL2lzc3Vlci5leGFtcGxlIiwic3ViIjoidXNlci0xMjMiLCJhdWQiOiJjbGllbnQiLCJleHAiOjE3MDAwMDAzMDAsImlhdCI6MTcwMDAwMDAwMCwibm9uY2UiOiJub25jZSIsImF1dGhfdGltZSI6MTcwMDAwMDAwMH0.WerTKH2HHHGAwJAQaC_f15jqNhm4Opk_rklhMXavQdztB_amj2tLAr7_OGAEfw2mPzqdi_kryWegtBmSrPZ2_LIQ-eruBfmTgb67dPm_Hfa3h0bG1lpceHUD59E4mGjsat5fvwmNxOadrJ34PWaNGO4Mj5SL1nFbtLl3BKGZrvwN1RhVFEoGP8O-LK0s3rKZTTz8xD0-mLGO0Pgk_PoTTQtB7FPg0EeqlNwST5mzxuJUfurDUbRdKp_x6hQkAu9j-jLRXqQKaY93o-4MC7OUbZB-uWPdIiS7u_b8KVB4sn4Mm_M0GHgPOAOUxvRNw5BPBNXfPtLIPhoaFhrW25A_cw",
+    "no_nonce": "eyJhbGciOiJSUzI1NiIsImtpZCI6ImZpeHR1cmUifQ.eyJpc3MiOiJodHRwczovL2lzc3Vlci5leGFtcGxlIiwic3ViIjoidXNlci0xMjMiLCJhdWQiOiJjbGllbnQiLCJleHAiOjE3MDAwMDAzMDAsImlhdCI6MTcwMDAwMDAwMCwiYXV0aF90aW1lIjoxNjk5OTk5OTkwfQ.a9vamDis5pdS275rbY5W0IqJoFU5WqewdhTH1wmDPfpbXKi0kMGFAi2QIzbvJfiuLHfXmeILJ-9oSEYkAgxkpiK8sS4IWeWUirUQ8y-E1TxxsUhSQi8bMsTPPxwOz7w_xUSuMaxvFfuwU-2o0SpH0YX1x_rLPpY108wLXphUz7qaSHUYhDY4JkJzO3gwO25QZsgcs6ZyC9VmalUbnndmCsBEk7m-2GFKaiF7a4-OGgwCg5IHrJuH3OSCBsQylLkX50bMoRoTmDicavMBKZ_I5ph_5SUJQE8xW1qWb_FfjRn9OtSmJN2dTukWiOcGUZWFgiiPKwo4lQ3Wo-gshRyhNA",
+    "alg": "eyJhbGciOiJIUzI1NiIsImtpZCI6ImZpeHR1cmUifQ.eyJpc3MiOiJodHRwczovL2lzc3Vlci5leGFtcGxlIiwic3ViIjoidXNlci0xMjMiLCJhdWQiOiJjbGllbnQiLCJleHAiOjE3MDAwMDAzMDAsImlhdCI6MTcwMDAwMDAwMCwibm9uY2UiOiJub25jZSIsImF1dGhfdGltZSI6MTY5OTk5OTk5MH0.kscvparKH5NLCsfgpFMpAmBX0jAAviGn7jn1lkwulDig08qWTBQwdSS4a9wfnRoLCmm_GU1YJQgnnGrdZ-7GxOu8i-Vfq8lc2vgyOl-89fc9i5iOqAe-tIFAPytQ94PFmUkib2j7HwpXMx-8cYFlXWXepf89vUJfmdzrVeuJHUnN66B6zvQKNI-pJzdaGwxID4NiyfhFbB9uIb3uTlUFkzgovqISvRMC2J3TTor5z0ybEiJOZsZC29s1RAqqs6uswkuxupV5NhQ8q7Yp0y0IMqFzbn6sFSWG1oXaDy4AymeoZli1MHM_JmFRW0ez6nhI6MtpvtPjwUvuljA6Gpw4Zg",
+    "crit": "eyJhbGciOiJSUzI1NiIsImtpZCI6ImZpeHR1cmUiLCJjcml0IjpbImV4dGVuc2lvbiJdfQ.eyJpc3MiOiJodHRwczovL2lzc3Vlci5leGFtcGxlIiwic3ViIjoidXNlci0xMjMiLCJhdWQiOiJjbGllbnQiLCJleHAiOjE3MDAwMDAzMDAsImlhdCI6MTcwMDAwMDAwMCwibm9uY2UiOiJub25jZSIsImF1dGhfdGltZSI6MTY5OTk5OTk5MH0.SHrtUvYwiXhp3-Qm3vUTox1wYfV_Zeubi5EY0rENTK4P3FXdRqO_nwReL7WPOY4oUIQ8zhIaxDKH8mu6f4gQZNLruK_fFazXdedSh0GzgsgUCkHzw8AwkAGQaR3BK0tpw1f7n4QeJW_agR67SnQe12tpaq-k5-oDvmYDt90JDpBLa9xhFYocwd0kn3u9mRP3wafRXJkPFDWbm4nTDnHyn03js1TJIUaY7j2VwBAMNZTwBV5AT1ymrOtPHHWsssfqz6_pISTwRV1DE1NkADoX2P9TEHc7WP2kYVXEIepjmRSZNsjqXg7ev68QiUcbFfnitVWWH5V3uH0pBXMjDYColA",
+    "unknown_kid": "eyJhbGciOiJSUzI1NiIsImtpZCI6Im5ldy1rZXkifQ.eyJpc3MiOiJodHRwczovL2lzc3Vlci5leGFtcGxlIiwic3ViIjoidXNlci0xMjMiLCJhdWQiOiJjbGllbnQiLCJleHAiOjE3MDAwMDAzMDAsImlhdCI6MTcwMDAwMDAwMCwibm9uY2UiOiJub25jZSIsImF1dGhfdGltZSI6MTY5OTk5OTk5MH0.DvkUzhduIfMw5xLlclSZMmRMe80SqrR6KaVjddb37y-tA44YfvzIaiiqijHs4ydFoUFGYQZYfqQW0h2NUNvzj3CjEoNt-Ob11VNy150IwIes4iIiVFem1PZQWWfMEIv8wGrezXB3prCl1_K6PVslFcHPLz7CknF57p3HCM9z67IKgtUKFWxAmdmvwntFh-xwsPLtfmcp0SRKwhTdYbYVSZraeOuN3wRIN73yzE8ute29rFG3v7snTK5CRZ7mf-8QySYIC2Nskt9b-yE-PZz6CN-C_PZLZ6e2Fc2CU9qKAzfXTLnAsvVayxJclOonf8KoRbcASQ07CjvxEsBd6WJhUA"
+}
+
+
+def settings() -> oidc.Settings:
+    return oidc.Settings("https://issuer.example", "client", "secret", "https://app.example/auth/oidc/callback", ["openid"])
+
+
+def original() -> oidc.TokenSet:
+    return oidc.TokenSet("user-123", "", "", "https://issuer.example", 1700000300.0, "access", "refresh", TOKENS["valid"], "nonce", 1699999990, ["client"])
+
+
+def _test_valid_signed_identity():
+    claims = oidc.validate_id_token(TOKENS["valid"], [KEY], settings(), "nonce", 1700000000)
+    testing.assertEqual(oidc.string(claims, "sub"), "user-123")
+
+
+def _test_signed_invalid_claims():
+    for name in ["issuer", "audience", "extra_audience", "nonce", "expired", "future", "not_before", "subject", "azp", "no_nonce", "alg", "crit", "unknown_kid"]:
+        try:
+            oidc.validate_id_token(TOKENS[name], [KEY], settings(), "nonce", 1700000000)
+        except oidc.PermanentError:
+            pass
+        else:
+            raise ValueError("Expected rejection: " + name)
+
+
+def _test_signature_and_key_checks():
+    parts = TOKENS["valid"].split(".")
+    signature = oidc_crypto.decode_base64url(parts[2])
+    signature = (b"x" if signature[0] != 120 else b"y") + signature[1:]
+    tampered = parts[0] + "." + parts[1] + "." + oidc_crypto.base64url(signature)
+    try:
+        oidc.validate_id_token(tampered, [KEY], settings(), "nonce", 1700000000)
+    except oidc.PermanentError:
+        pass
+    else:
+        raise ValueError("Expected signature rejection")
+    for keys in [[KEY, KEY], []]:
+        try:
+            oidc.validate_id_token(TOKENS["valid"], keys, settings(), "nonce", 1700000000)
+        except oidc.PermanentError:
+            pass
+        else:
+            raise ValueError("Expected ambiguous/missing key rejection")
+    testing.assertFalse(oidc_crypto.verify_rs256(b"text", b"signature", b"short", b"\x01\x00\x01"))
+
+
+def _test_refresh_identity_continuity():
+    # OIDC refresh may omit nonce, but cannot change the authenticated identity.
+    oidc.validate_id_token(TOKENS["no_nonce"], [KEY], settings(), "nonce", 1700000000, original())
+    for name in ["refresh_subject", "refresh_auth_time", "nonce"]:
+        try:
+            oidc.validate_id_token(TOKENS[name], [KEY], settings(), "nonce", 1700000000, original())
+        except oidc.PermanentError:
+            pass
+        else:
+            raise ValueError("Expected refresh identity rejection")
+
+
+def _test_ambiguous_json_and_endpoint_rejected():
+    for raw in [b'{"iss":"a","iss":"b"}', b'{"s":"x\\u0000y"}', b'{"i\\u0073s":"a","iss":"b"}']:
+        testing.assertFalse(oidc_crypto.json_document_valid(raw))
+    for url in ["http://issuer.example", "https://user@issuer.example", "https://issuer.example/#fragment", "https://issuer.example:0", "https://issuer.example\\evil", "https://issuer.example:65536"]:
+        try:
+            oidc.endpoint(url, True)
+        except oidc.PermanentError:
+            pass
+        else:
+            raise ValueError("Expected endpoint rejection")
+    testing.assertEqual(oidc.endpoint("http://oidc.localhost:5556/dex", True).host, "oidc.localhost")
+    testing.assertEqual(oidc.endpoint("https://issuer.example/path?name=value").path, "/path")
+    try:
+        oidc.endpoint("http://localhost:5556/dex")
+    except oidc.PermanentError:
+        pass
+    else:
+        raise ValueError("Expected HTTP disabled by default")

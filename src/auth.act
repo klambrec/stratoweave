@@ -1,0 +1,523 @@
+"""Browser authentication: opaque process-local sessions and CSRF protection.
+
+OAuth tokens are held only in Session objects. Never serialize these objects
+into TTT, send them to browsers, or include them in application logs.
+"""
+import argconf
+import http_router
+import json
+import oidc
+import oidc_crypto as crypto
+import time
+import uri
+
+
+class Settings(value):
+    public_origin: str
+    allow_insecure_http: bool
+    idle_seconds: int
+    absolute_seconds: int
+    local_username: str
+    local_password_hash_file: ?str
+    issuer: str
+    client_id: str
+    client_secret_file: ?str
+    allowed_subjects: list[str]
+    scopes: list[str]
+
+    def __init__(self, public_origin: str="", allow_insecure_http: bool=False,
+                 idle_seconds: int=1800, absolute_seconds: int=28800,
+                 local_username: str="", local_password_hash_file: ?str=None,
+                 issuer: str="", client_id: str="", client_secret_file: ?str=None,
+                 allowed_subjects: ?list[str]=None, scopes: ?list[str]=None):
+        self.public_origin = public_origin
+        self.allow_insecure_http = allow_insecure_http
+        self.idle_seconds = idle_seconds
+        self.absolute_seconds = absolute_seconds
+        self.local_username = local_username
+        self.local_password_hash_file = local_password_hash_file
+        self.issuer = issuer
+        self.client_id = client_id
+        self.client_secret_file = client_secret_file
+        self.allowed_subjects = allowed_subjects if allowed_subjects is not None else []
+        self.scopes = scopes if scopes is not None else ["openid", "profile", "email", "offline_access"]
+
+    def enabled(self) -> bool:
+        return self.issuer != "" or self.local_username != ""
+
+    def validate(self):
+        oidc_parts = [self.issuer != "", self.client_id != "", self.client_secret_file is not None]
+        if True in oidc_parts and False in oidc_parts:
+            raise argconf.ConfigurationError("HTTP OIDC requires issuer, client_id and client_secret_file")
+        if (self.local_username != "") != (self.local_password_hash_file is not None):
+            raise argconf.ConfigurationError("HTTP local authentication requires username and password_hash_file")
+        if self.issuer != "" and len(self.allowed_subjects) == 0:
+            raise argconf.ConfigurationError("HTTP OIDC requires a nonempty allowed_subjects list")
+        if self.issuer == "" and len(self.allowed_subjects) > 0:
+            raise argconf.ConfigurationError("HTTP OIDC allowed_subjects requires a configured issuer")
+        if self.public_origin != "" and not self.enabled():
+            raise argconf.ConfigurationError("HTTP authentication public_origin requires a configured local or OIDC login method")
+        if self.idle_seconds < 1 or self.absolute_seconds < self.idle_seconds:
+            raise argconf.ConfigurationError("HTTP session lifetimes require 0 < idle_seconds <= absolute_seconds")
+        if not self.enabled():
+            return
+        try:
+            parsed = uri.URI(self.public_origin)
+            if parsed.host is None or "@" in uri.e_str(parsed.authority) or parsed.query is not None or parsed.fragment is not None:
+                raise ValueError("invalid origin")
+            if any([c.isspace() for c in self.public_origin]):
+                raise ValueError("origin must not contain whitespace")
+            if parsed.path is not None and parsed.path != "":
+                raise ValueError("origin must not include a path or trailing slash")
+            if parsed.scheme != "https":
+                if parsed.scheme != "http" or not self.allow_insecure_http or not loopback_host(parsed.host!):
+                    raise ValueError("HTTPS required (HTTP development mode requires a loopback origin)")
+        except Exception as exc:
+            raise argconf.ConfigurationError("Invalid http.auth.public_origin: {exc}")
+
+    @staticmethod
+    def declare(p: argconf.Parser):
+        p.add_str("http.auth.public_origin", default="", help="Exact public origin of the SPA and APIs")
+        p.add_bool("http.auth.allow_insecure_http", default=False, help="Permit loopback-only HTTP development authentication")
+        p.add_int("http.auth.session_idle_seconds", default=1800, help="Idle browser session lifetime")
+        p.add_int("http.auth.session_absolute_seconds", default=28800, help="Maximum browser session lifetime")
+        p.add_str("http.auth.local.username", default="", help="Optional independent local HTTP account")
+        p.add_str("http.auth.local.password_hash_file", help="File containing the local account bcrypt password hash")
+        p.add_str("http.auth.oidc.issuer", default="", help="Exact configured OIDC issuer")
+        p.add_str("http.auth.oidc.client_id", default="", help="Confidential OIDC client ID")
+        p.add_str("http.auth.oidc.client_secret_file", help="File containing the OIDC client secret")
+        p.add_str_list("http.auth.oidc.allowed_subjects", default=[], help="OIDC subject identifiers granted full application access")
+        p.add_str_list("http.auth.oidc.scopes", default=["openid", "profile", "email", "offline_access"], help="OIDC authorization scopes")
+
+    @staticmethod
+    def read(args: argconf.Config) -> Settings:
+        result = Settings(args.get_str("http.auth.public_origin"),
+                          args.get_bool("http.auth.allow_insecure_http"),
+                          args.get_int("http.auth.session_idle_seconds"),
+                          args.get_int("http.auth.session_absolute_seconds"),
+                          args.get_str("http.auth.local.username"),
+                          args.get_opt_str("http.auth.local.password_hash_file"),
+                          args.get_str("http.auth.oidc.issuer"),
+                          args.get_str("http.auth.oidc.client_id"),
+                          args.get_opt_str("http.auth.oidc.client_secret_file"),
+                          args.get_str_list("http.auth.oidc.allowed_subjects"),
+                          args.get_str_list("http.auth.oidc.scopes"))
+        result.validate()
+        return result
+
+
+def loopback_host(host: str) -> bool:
+    return host == "localhost" or host.endswith(".localhost") or host == "127.0.0.1" or host == "::1" or host == "[::1]"
+
+
+def valid_password_hash(password_hash: str) -> bool:
+    if len(password_hash) != 60 or password_hash[:4] not in ["$2b$", "$2y$"] or password_hash[6] != "$":
+        return False
+    if password_hash[4] not in "0123456789" or password_hash[5] not in "0123456789":
+        return False
+    cost = int(password_hash[4:6])
+    if cost < 4 or cost > 16:
+        return False
+    for character in password_hash[7:]:
+        if character not in "./ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789":
+            return False
+    return True
+
+
+def safe_return_to(target: str) -> str:
+    if not target.startswith("/") or target.startswith("//") or "\\" in target or "%00" in target:
+        return "/"
+    for character in target:
+        if ord(character) < 32 or ord(character) == 127:
+            return "/"
+    # Prevent percent-encoded slash/backslash variants from becoming open redirects.
+    decoded = uri.unquote(target)
+    if decoded.startswith("//") or "\\" in decoded or "\r" in decoded or "\n" in decoded:
+        return "/"
+    for character in decoded:
+        if ord(character) < 32 or ord(character) == 127:
+            return "/"
+    decoded_path = uri.e_str(uri.URI(decoded).path)
+    parts = [part for part in decoded_path.split("/") if part != "" and part != "."]
+    if ".." in parts or (len(parts) > 0 and parts[0] == "auth"):
+        return "/"
+    return target
+
+
+def cookie_value(header: str, name: str) -> ?str:
+    found: ?str = None
+    for part in header.split(";"):
+        pair = part.strip().split("=", 1)
+        if len(pair) == 2 and pair[0] == name:
+            if found is not None:
+                return None
+            found = pair[1]
+    return found
+
+
+def _clock() -> float:
+    seconds, ns = time.get_monotonic()
+    return float(seconds) + float(ns) / 1000000000.0
+
+
+def _wall_clock() -> float:
+    seconds, ns = time.get_realtime()
+    return float(seconds) + float(ns) / 1000000000.0
+
+
+class Session(object):
+    waiters: list[proc(?Session, bool) -> None]
+
+    def __init__(self, csrf: str, now: float, subject: str="", display_name: str="", tokens: ?oidc.TokenSet=None):
+        self.csrf = csrf
+        self.created_at = now
+        self.last_used = now
+        self.subject = subject
+        self.display_name = display_name
+        self.tokens = tokens
+        self.refreshing = False
+        self.waiters = []
+        self.state = ""
+        self.nonce = ""
+        self.verifier = ""
+        self.return_to = "/"
+
+
+actor Auth(settings: Settings, provider: ?oidc.Provider=None, local_password_hash: ?str=None):
+    var sessions: dict[str, Session] = {}
+    var login_attempts = 0
+    var login_window = _clock()
+    var oidc_attempts = 0
+    var oidc_window = _clock()
+    _secure = settings.public_origin.startswith("https://")
+    _cookie_name = "__Host-stratoweave-session" if _secure else "stratoweave-session"
+
+    def _cookie(identifier: str, authenticated: bool=False) -> str:
+        lifetime = settings.absolute_seconds if authenticated else 300
+        same_site = "Strict" if authenticated else "Lax"
+        return _cookie_name + "=" + identifier + "; Path=/; HttpOnly; SameSite=" + same_site + "; Max-Age=" + str(lifetime) + ("; Secure" if _secure else "")
+
+    def _clear_cookie() -> str:
+        return _cookie_name + "=; Path=/; HttpOnly; SameSite=Strict; Max-Age=0" + ("; Secure" if _secure else "")
+
+    def _headers(cookie: ?str=None) -> dict[str, str]:
+        headers = {"Content-Type": "application/json", "Cache-Control": "no-store", "Pragma": "no-cache", "Referrer-Policy": "no-referrer"}
+        if cookie is not None:
+            headers["Set-Cookie"] = cookie
+        return headers
+
+    def _error(respond: proc(int, dict[str, str], str) -> None, status: int, message: str):
+        respond(status, _headers(), json.encode({"error": message}, pretty=False))
+
+    def _expired(session: Session, now: float) -> bool:
+        if session.subject == "":
+            return now - session.created_at >= 300.0
+        return now - session.created_at >= float(settings.absolute_seconds) or now - session.last_used >= float(settings.idle_seconds)
+
+    def _cleanup():
+        now = _clock()
+        for key in list(sessions.keys()):
+            if _expired(sessions[key], now):
+                del sessions[key]
+
+    def _periodic_cleanup():
+        _cleanup()
+        after 60: _periodic_cleanup()
+
+    def _session(ctx: http_router.Context) -> ?Session:
+        _cleanup()
+        identifier = cookie_value(ctx.request.headers.get_def("cookie", ""), _cookie_name)
+        if identifier is None:
+            return None
+        return sessions.get(identifier!)
+
+    def _remove(ctx: http_router.Context):
+        identifier = cookie_value(ctx.request.headers.get_def("cookie", ""), _cookie_name)
+        if identifier is not None and identifier! in sessions:
+            del sessions[identifier!]
+
+    def _csrf(ctx: http_router.Context, session: ?Session) -> bool:
+        if session is None or ctx.request.headers.get_def("origin", "") != settings.public_origin:
+            return False
+        supplied = ctx.request.headers.get_def("x-csrf-token", "")
+        return supplied != "" and crypto.constant_time_equal(supplied, session!.csrf)
+
+    def _result(session: ?Session, provider_unavailable: bool=False) -> str:
+        user: ?dict[str, str] = None
+        authenticated = session is not None and session!.subject != "" and not provider_unavailable
+        if session is not None and authenticated:
+            user = {"subject": session!.subject, "display_name": session!.display_name}
+        return json.encode({"enabled": settings.enabled(), "authenticated": authenticated,
+                            "oidc_enabled": provider is not None, "local_enabled": local_password_hash is not None,
+                            "user": user, "csrf_token": session!.csrf if session is not None else "",
+                            "provider_unavailable": provider_unavailable}, pretty=False)
+
+    def _new_session(ctx: http_router.Context, subject: str="", name: str="", tokens: ?oidc.TokenSet=None) -> ?(identifier: str, session: Session):
+        _cleanup()
+        previous = _session(ctx)
+        if previous is not None:
+            previous_tokens = previous!.tokens
+            p = provider
+            if previous_tokens is not None and p is not None:
+                p!.revoke(previous_tokens!)
+        _remove(ctx)
+        if len(sessions) >= 1024:
+            return None
+        identifier = crypto.random_token()
+        session = Session(crypto.random_token(), _clock(), subject, name, tokens)
+        sessions[identifier] = session
+        return (identifier=identifier, session=session)
+
+    def _validate_session(ctx: http_router.Context, done: proc(?Session, bool) -> None):
+        candidate = _session(ctx)
+        if candidate is None or candidate!.subject == "":
+            done(None, False)
+            return
+        session = candidate!
+        tokens = session.tokens
+        p = provider
+        if tokens is None or p is None:
+            session.last_used = _clock()
+            done(session, False)
+            return
+        if tokens!.expires_at > _wall_clock() + 15.0:
+            session.last_used = _clock()
+            done(session, False)
+            return
+        if len(session.waiters) >= 64:
+            done(None, True)
+            return
+        session.waiters.append(done)
+        if session.refreshing:
+            return
+        session.refreshing = True
+        def refreshed(updated: ?oidc.TokenSet, error: ?Exception):
+            session.refreshing = False
+            waiters = session.waiters
+            session.waiters = []
+            current_session = _session(ctx)
+            valid = current_session is not None and crypto.constant_time_equal(current_session!.csrf, session.csrf)
+            temporary = isinstance(error, oidc.TemporaryError)
+            if updated is not None and valid:
+                session.tokens = updated
+                session.last_used = _clock()
+                for callback in waiters:
+                    callback(session, False)
+            else:
+                if updated is not None:
+                    p!.revoke(updated!)
+                if not temporary:
+                    _remove(ctx)
+                for callback in waiters:
+                    callback(None, temporary)
+        p!.refresh(tokens!, refreshed)
+
+    def session_status(ctx: http_router.Context, respond: proc(int, dict[str, str], str) -> None):
+        if not settings.enabled():
+            respond(200, _headers(), _result(None))
+            return
+        existing = _session(ctx)
+        if existing is not None and existing!.subject != "":
+            def validated(session: ?Session, temporary: bool):
+                if temporary:
+                    # Keep local fallback available even when a returning OIDC
+                    # session cannot currently refresh. API requests still fail.
+                    current_session = _session(ctx)
+                    if current_session is None:
+                        _bootstrap(ctx, respond)
+                    else:
+                        respond(200, _headers(), _result(current_session, True))
+                elif session is not None:
+                    respond(200, _headers(), _result(session))
+                else:
+                    _bootstrap(ctx, respond)
+            _validate_session(ctx, validated)
+            return
+        _bootstrap(ctx, respond)
+
+    def _bootstrap(ctx: http_router.Context, respond: proc(int, dict[str, str], str) -> None):
+        existing = _session(ctx)
+        if existing is not None:
+            respond(200, _headers(), _result(existing))
+            return
+        created = _new_session(ctx)
+        if created is None:
+            _error(respond, 503, "Authentication session capacity exceeded")
+            return
+        respond(200, _headers(_cookie(created!.identifier)), _result(created!.session))
+
+    def local_login(ctx: http_router.Context, respond: proc(int, dict[str, str], str) -> None):
+        password_hash = local_password_hash
+        if password_hash is None:
+            _error(respond, 404, "Local login is not configured")
+            return
+        if not _csrf(ctx, _session(ctx)):
+            _error(respond, 403, "Invalid CSRF token or request origin")
+            return
+        if _clock() - login_window >= 60.0:
+            login_window = _clock()
+            login_attempts = 0
+        if login_attempts >= 10:
+            _error(respond, 429, "Too many login attempts; retry in one minute")
+            return
+        login_attempts += 1
+        if len(ctx.request.body) > 4096:
+            _error(respond, 413, "Login request is too large")
+            return
+        username = ""
+        password = ""
+        try:
+            if not crypto.json_document_valid(ctx.request.body):
+                raise ValueError("Malformed, duplicate or NUL-containing login JSON")
+            payload = json.decode(ctx.request.body.decode())
+            if isinstance(payload, dict):
+                u = payload.get("username")
+                p = payload.get("password")
+                if isinstance(u, str) and isinstance(p, str):
+                    username = u
+                    password = p
+            if len(password.encode()) > 72:
+                raise ValueError("Password exceeds bcrypt input limit")
+        except Exception:
+            _error(respond, 400, "Invalid login request")
+            return
+        correct = crypto.verify_password(password, password_hash!)
+        if not correct or not crypto.constant_time_equal(username, settings.local_username):
+            _error(respond, 401, "Invalid username or password")
+            return
+        created = _new_session(ctx, "local:" + settings.local_username, settings.local_username)
+        if created is None:
+            _error(respond, 503, "Authentication session capacity exceeded")
+            return
+        respond(200, _headers(_cookie(created!.identifier, True)), _result(created!.session))
+
+    def oidc_login(ctx: http_router.Context, respond: proc(int, dict[str, str], str) -> None):
+        p = provider
+        if p is None:
+            _error(respond, 404, "OIDC login is not configured")
+            return
+        if _clock() - oidc_window >= 60.0:
+            oidc_window = _clock()
+            oidc_attempts = 0
+        if oidc_attempts >= 30:
+            _error(respond, 429, "Too many OIDC login attempts; retry in one minute")
+            return
+        oidc_attempts += 1
+        created = _new_session(ctx)
+        if created is None:
+            _error(respond, 503, "Authentication session capacity exceeded")
+            return
+        session = created!.session
+        session.state = crypto.random_token()
+        session.nonce = crypto.random_token()
+        session.verifier = crypto.random_token()
+        try:
+            query = http_router.parse_query_strict(ctx.raw_path)
+            session.return_to = safe_return_to(query.get_def("return_to", "/"))
+        except Exception:
+            if created!.identifier in sessions:
+                del sessions[created!.identifier]
+            _error(respond, 400, "Invalid login query")
+            return
+        def ready(url: ?str, error: ?Exception):
+            if url is None or error is not None:
+                if created!.identifier in sessions:
+                    del sessions[created!.identifier]
+                _error(respond, 503, "Authentication provider is temporarily unavailable")
+                return
+            headers = _headers(_cookie(created!.identifier))
+            headers["Location"] = url!
+            respond(302, headers, "")
+        p!.begin(session.state, session.nonce, session.verifier, ready)
+
+    def oidc_callback(ctx: http_router.Context, respond: proc(int, dict[str, str], str) -> None):
+        p = provider
+        candidate = _session(ctx)
+        if p is None or candidate is None or candidate!.state == "":
+            _error(respond, 400, "Invalid or expired login transaction")
+            return
+        session = candidate!
+        query: dict[str, str] = {}
+        try:
+            query = http_router.parse_query_strict(ctx.raw_path)
+        except Exception:
+            _error(respond, 400, "Invalid callback query")
+            return
+        if not crypto.constant_time_equal(query.get_def("state", ""), session.state):
+            _error(respond, 400, "Invalid login state")
+            return
+        session.state = ""
+        if "error" in query or query.get_def("code", "") == "":
+            _remove(ctx)
+            _error(respond, 400, "Provider denied the login request")
+            return
+        def exchanged(tokens: ?oidc.TokenSet, error: ?Exception):
+            if tokens is None or error is not None:
+                _remove(ctx)
+                _error(respond, 401, "OIDC login failed")
+                return
+            if tokens!.subject not in settings.allowed_subjects:
+                _remove(ctx)
+                p!.revoke(tokens!)
+                _error(respond, 403, "This identity is not allowed to access the application")
+                return
+            current_session = _session(ctx)
+            if current_session is None or not crypto.constant_time_equal(current_session!.csrf, session.csrf):
+                p!.revoke(tokens!)
+                _error(respond, 400, "Login transaction expired")
+                return
+            created = _new_session(ctx, tokens!.subject, tokens!.name, tokens)
+            if created is None:
+                p!.revoke(tokens!)
+                _error(respond, 503, "Authentication session capacity exceeded")
+                return
+            headers = _headers(_cookie(created!.identifier, True))
+            headers["Location"] = session.return_to
+            respond(303, headers, "")
+        p!.exchange(query["code"], session.nonce, session.verifier, exchanged)
+
+    def logout(ctx: http_router.Context, respond: proc(int, dict[str, str], str) -> None):
+        session = _session(ctx)
+        if session is None:
+            respond(401, _headers(_clear_cookie()), json.encode({"error": "Authentication session has ended"}, pretty=False))
+            return
+        if not _csrf(ctx, session):
+            _error(respond, 403, "Invalid CSRF token or request origin")
+            return
+        _remove(ctx)
+        if session is not None:
+            tokens = session!.tokens
+            p = provider
+            if tokens is not None and p is not None:
+                p!.revoke(tokens!)
+        respond(200, _headers(_clear_cookie()), _result(None))
+
+    def protect(ctx: http_router.Context, respond: proc(int, dict[str, str], str) -> None,
+                next_handler: proc(http_router.Context, proc(int, dict[str, str], str) -> None) -> None):
+        if not settings.enabled():
+            next_handler(ctx, respond)
+            return
+        def validated(session: ?Session, temporary: bool):
+            if session is None:
+                _error(respond, 503 if temporary else 401, "Authentication provider is temporarily unavailable" if temporary else "Authentication required")
+                return
+            if ctx.request.method not in ["GET", "HEAD", "OPTIONS"] and not _csrf(ctx, session):
+                _error(respond, 403, "Invalid CSRF token or request origin")
+                return
+            ctx.set("auth.subject", session!.subject)
+            ctx.set("auth.display_name", session!.display_name)
+            def private_response(status: int, headers: dict[str, str], body: str):
+                headers["Cache-Control"] = "no-store"
+                headers["Referrer-Policy"] = "no-referrer"
+                respond(status, headers, body)
+            next_handler(ctx, private_response)
+        _validate_session(ctx, validated)
+
+    def install(router: http_router.Router):
+        router.get("/auth/session", session_status)
+        router.get("/auth/oidc/login", oidc_login)
+        router.get("/auth/oidc/callback", oidc_callback)
+        router.post("/auth/local/login", local_login)
+        router.post("/auth/logout", logout)
+
+    after 60: _periodic_cleanup()

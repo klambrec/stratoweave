@@ -99,6 +99,89 @@ The most important settings are:
   instead of continuing to serve traffic. This is useful for CI validation or
   one-shot initialization jobs.
 
+### Browser authentication
+
+HTTP authentication is enabled when an OIDC issuer or a local HTTP account is
+configured. Both methods can be enabled together; the local account remains
+available when the identity provider is unavailable. Incomplete authentication
+settings fail at startup. With neither method configured, the existing
+unauthenticated HTTP behavior remains available.
+
+```aon title="system.aon"
+http:
+    port = 8443
+    tls:
+        certificate_file = "/run/secrets/https-certificate.pem"
+        private_key_file = "/run/secrets/https-private-key.pem"
+    auth:
+        public_origin = "https://sorespo.example.org:8443"
+        session_idle_seconds = 1800
+        session_absolute_seconds = 28800
+        local:
+            username = "operator"
+            password_hash_file = "/run/secrets/http-password.bcrypt"
+        oidc:
+            issuer = "https://identity.example.org/dex"
+            client_id = "sorespo"
+            client_secret_file = "/run/secrets/oidc-client-secret"
+            allowed_subjects = ["provider-issued-subject-id"]
+            scopes = ["openid", "profile", "email", "offline_access"]
+```
+
+Register the application as a confidential OIDC client with the exact redirect
+URI `https://sorespo.example.org:8443/auth/oidc/callback`. The provider must
+support Authorization Code flow, S256 PKCE, discovery, JWKS, and RS256 ID
+tokens. Add the provider's stable `sub` identifiers to `allowed_subjects`;
+email addresses and display names do not grant access. Every admitted identity
+has full access to the current APIs, including configuration and device
+credentials. Group mappings and restricted roles are not implemented.
+
+The local account is separate from NETCONF's username and password. Its file
+contains a bcrypt `$2b$` or `$2y$` hash, not a plaintext password. Supported
+bcrypt costs are 4 through 16; use an appropriate production cost when
+generating the hash. Passwords must fit bcrypt's 72-byte input limit. Protect
+the password hash, client secret and TLS private key files using deployment
+secret mounts and file permissions. File contents are loaded at startup.
+
+`public_origin` is the exact browser-visible scheme, host and optional port,
+without a trailing slash. A TLS-terminating reverse proxy can serve that
+origin instead of native TLS; omit both `http.tls` files in that deployment
+and restrict access to the backend listener. The backend does not infer a
+trusted origin from forwarded headers. Provider HTTPS connections use normal
+certificate verification and the runtime trust store. The explicit
+`http.auth.allow_insecure_http = True` option permits development HTTP only
+for `localhost`, `.localhost` names and loopback addresses.
+
+The SPA and APIs share one origin. The browser receives an opaque HttpOnly
+cookie, while access, refresh and ID tokens remain in the backend. A login
+redirect carries a one-use authorization code; the callback immediately
+redirects to a clean application URL. The SPA fetches `/auth/session` to learn
+the available login methods, identity and CSRF token. Local login, logout and
+API mutations require that CSRF token in `X-CSRF-Token` and an `Origin` matching
+`public_origin`. Device resynchronization uses `POST /device/{name}/resync`.
+Programmatic HTTP clients can use the same login and cookie flow; bearer-token
+API authentication is not provided by this implementation.
+
+Sessions are process-local, expire after the configured idle or absolute
+lifetime, and are invalidated by a restart. Idle time is measured from API
+activity, including SPA polling. Refresh is performed in the backend with one
+refresh operation per session at a time. Logout invalidates the local session
+and requests provider revocation when available; it does not sign the user out
+of the provider's other applications. An expired or revoked session returns
+`401`; a temporary provider failure denies API access while preserving local
+login availability. Login attempts and session storage are bounded.
+
+Authentication is rejected in Acton durable-runtime builds because their
+actor snapshots could persist credentials. The separate StratoWeave `--db`
+option for TTT data remains supported and does not persist browser sessions.
+HTTP wire-level tracing is disabled for the standard authenticated runtime;
+router access logs contain paths and status codes without token-bearing query
+strings, cookies or request bodies.
+
+For example, the environment spelling of `http.auth.public_origin` is
+`STRATOWEAVE_HTTP__AUTH__PUBLIC_ORIGIN`. Lists use AON syntax in environment
+variables, such as `STRATOWEAVE_HTTP__AUTH__OIDC__ALLOWED_SUBJECTS='["subject"]'`.
+
 ### NETCONF server SSH transport
 
 The SSH transport the northbound NETCONF server offers is configured under
