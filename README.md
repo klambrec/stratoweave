@@ -25,4 +25,4 @@ We try to "left shift" run time errors to compile / development time so we can d
 
 The ideas behind StratoWeave has its roots in ideas from functional programming combined with some influence from a decade of experience in operating large IP networks using automation. We just recently started building, but we have been thinking about this for a long time. We know what we want, now we just got to write some code.
 
-@klambrec
+[klambrec](https://github.com/klambrec)
