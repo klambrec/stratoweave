@@ -24,3 +24,5 @@ The platform in itself is purely reactive, acting on input events, either config
 We try to "left shift" run time errors to compile / development time so we can detect and avoid bugs before committing code, building better and more robust automation systems. For example by turning YANG models into types, we can utilize the static type system of the programming language compiler to detect spelling mistakes or other data errors at compile time.
 
 The ideas behind StratoWeave has its roots in ideas from functional programming combined with some influence from a decade of experience in operating large IP networks using automation. We just recently started building, but we have been thinking about this for a long time. We know what we want, now we just got to write some code.
+
+@klambrec
